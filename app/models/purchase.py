@@ -161,6 +161,15 @@ class PurchaseReturn(Base):
     total_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0, server_default="0"
     )
+    penalty: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
+    refund_amount: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
+    return_type: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="partial", server_default="partial"
+    )
     status: Mapped[ReturnStatus] = mapped_column(
         Enum(ReturnStatus, name="return_status", native_enum=True),
         nullable=False,
@@ -173,6 +182,13 @@ class PurchaseReturn(Base):
     approved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    rejected_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

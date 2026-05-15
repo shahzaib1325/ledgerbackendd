@@ -184,14 +184,20 @@ class SaleReturnRepository:
         db: AsyncSession,
         *,
         invoice_id: int,
+        return_type: str,
         reason: str | None,
         total_amount: Decimal,
+        penalty: Decimal,
+        refund_amount: Decimal,
         created_by: int | None,
     ) -> SaleReturn:
         ret = SaleReturn(
             invoice_id=invoice_id,
+            return_type=return_type,
             reason=reason,
             total_amount=total_amount,
+            penalty=penalty,
+            refund_amount=refund_amount,
             status=ReturnStatus.pending,
             created_by=created_by,
         )

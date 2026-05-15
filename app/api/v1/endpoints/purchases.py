@@ -40,6 +40,7 @@ from app.schemas.purchase import (
     PurchasePaymentCreate,
     PurchasePaymentOut,
     PurchaseReturnCreate,
+    PurchaseReturnRejectRequest,
     PurchaseReturnOut,
     PurchaseSortField,
     PurchaseUpdate,
@@ -287,11 +288,14 @@ async def approve_return(
 async def reject_return(
     purchase_id: int,
     return_id: int,
+    body: PurchaseReturnRejectRequest,
     db: DbDep,
     current_user: WriteDep,
 ) -> SuccessResponse[PurchaseReturnOut]:
     purchase_return = await purchase_service.reject_return(
-        db, purchase_id, return_id, rejected_by=current_user.id
+        db, purchase_id, return_id,
+        rejected_by=current_user.id,
+        rejection_reason=body.rejection_reason,
     )
     await db.commit()
     return SuccessResponse(data=PurchaseReturnOut.model_validate(purchase_return))

@@ -695,11 +695,17 @@ async def create_return(
             f"invoice total ({invoice.total_amount}).",
         )
 
+    penalty = body.penalty
+    refund_amount = max(Decimal("0"), total_amount - penalty)
+
     sale_return = await _ret_repo.create_return(
         db,
         invoice_id=invoice_id,
+        return_type=body.return_type,
         reason=body.reason,
         total_amount=total_amount,
+        penalty=penalty,
+        refund_amount=refund_amount,
         created_by=created_by,
     )
 
@@ -753,7 +759,11 @@ async def approve_return(
             created_by=approved_by,
         )
 
-    # Reduce customer receivable by return amount
+    # Financial amounts: refund_amount is what the customer actually gets back
+    # (total_amount minus penalty). Penalty is retained as revenue.
+    refund = sale_return.refund_amount
+
+    # Reduce customer receivable by refund amount (not total — penalty is kept)
     customer_repo = CustomerRepository()
     invoice = await _repo.get_with_lock(db, invoice_id)
     customer = await customer_repo.get_with_lock(db, invoice.customer_id) if invoice.customer_id else None
@@ -761,7 +771,7 @@ async def approve_return(
         new_balance, new_balance_type = _compute_new_balance(
             customer.balance,
             customer.balance_type,
-            delta=-sale_return.total_amount,
+            delta=-refund,
         )
         await customer_repo.apply_balance_update(
             db, customer,
@@ -769,20 +779,34 @@ async def approve_return(
             new_balance_type=new_balance_type,
         )
 
-    # Post reversal transaction: revenue recognized at sale is reversed
+    # Post reversal transaction for the refund amount
     from app.services import transaction_service
     from app.models.enums import TransactionType, ReferenceType
     invoice_for_return = await _repo.get_with_items(db, invoice_id)
-    await transaction_service.record_reference_transaction(
-        db,
-        payment_method=None,
-        transaction_type=TransactionType.debit,
-        reference_type=ReferenceType.sale_return,
-        reference_id=return_id,
-        amount=sale_return.total_amount,
-        description=f"{invoice_for_return.invoice_no} — sale return approved",
-        created_by=approved_by,
-    )
+    if refund > Decimal("0"):
+        await transaction_service.record_reference_transaction(
+            db,
+            payment_method=None,
+            transaction_type=TransactionType.debit,
+            reference_type=ReferenceType.sale_return,
+            reference_id=return_id,
+            amount=refund,
+            description=f"{invoice_for_return.invoice_no} — sale return refund",
+            created_by=approved_by,
+        )
+
+    # Post penalty as revenue if applicable
+    if sale_return.penalty > Decimal("0"):
+        await transaction_service.record_reference_transaction(
+            db,
+            payment_method=None,
+            transaction_type=TransactionType.credit,
+            reference_type=ReferenceType.sale_return,
+            reference_id=return_id,
+            amount=sale_return.penalty,
+            description=f"{invoice_for_return.invoice_no} — return penalty/restocking fee",
+            created_by=approved_by,
+        )
 
     now = datetime.now(timezone.utc)
     await _ret_repo.approve(
@@ -790,15 +814,12 @@ async def approve_return(
     )
 
     # Update invoice paid_amount and status to reflect the return
-    # Reduce paid_amount by the return amount (clamped to 0)
-    new_paid = max(Decimal("0"), invoice_for_return.paid_amount - sale_return.total_amount)
+    new_paid = max(Decimal("0"), invoice_for_return.paid_amount - refund)
     invoice_for_return.paid_amount = new_paid
-    # Recalculate status
     if new_paid <= Decimal("0"):
         invoice_for_return.status = SaleStatus.confirmed
-    elif new_paid < invoice_for_return.total_amount - sale_return.total_amount:
+    elif new_paid < invoice_for_return.total_amount:
         invoice_for_return.status = SaleStatus.partially_paid
-    # If fully paid after return adjustment, keep paid
     db.add(invoice_for_return)
 
     await db.flush()

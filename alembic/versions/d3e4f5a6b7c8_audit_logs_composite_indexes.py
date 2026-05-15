@@ -17,12 +17,10 @@ def upgrade() -> None:
     op.create_index(
         'idx_audit_action_created',
         'audit_logs', ['action', 'created_at'],
-        postgresql_concurrently=True,
     )
     op.create_index(
         'idx_audit_table_action_created',
         'audit_logs', ['table_name', 'action', 'created_at'],
-        postgresql_concurrently=True,
     )
 
 

@@ -223,7 +223,9 @@ class SaleReturnItemOut(BaseModel):
 
 
 class SaleReturnCreate(BaseModel):
+    return_type: Literal["complete", "partial"] = "partial"
     reason: str | None = None
+    penalty: Decimal = Field(default=Decimal("0"), ge=0, decimal_places=2)
     items: list[SaleReturnItemCreate] = Field(..., min_length=1)
 
 
@@ -235,8 +237,11 @@ class SaleReturnOut(BaseModel):
     id: int
     invoice_id: int
     return_date: date
+    return_type: str
     reason: str | None
     total_amount: Decimal
+    penalty: Decimal
+    refund_amount: Decimal
     status: ReturnStatus
     approved_by: int | None
     approved_at: datetime | None

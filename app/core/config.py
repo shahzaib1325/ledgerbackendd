@@ -28,7 +28,10 @@ class Settings(BaseSettings):
     EXPORT_STORAGE_PATH: str = "/tmp/smartledger_exports"
     EXPORT_MAX_ROWS_SYNC: int = 1000
 
-    model_config = SettingsConfigDict(env_file=_ENV_FILE, case_sensitive=True)
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILE if _ENV_FILE.exists() else None,
+        case_sensitive=True,
+    )
 
     @property
     def allowed_origins_list(self) -> list[str]:

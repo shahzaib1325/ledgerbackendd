@@ -205,14 +205,20 @@ class PurchaseReturnRepository:
         db: AsyncSession,
         *,
         purchase_id: int,
+        return_type: str,
         reason: str | None,
         total_amount: Decimal,
+        penalty: Decimal,
+        refund_amount: Decimal,
         created_by: int | None,
     ) -> PurchaseReturn:
         ret = PurchaseReturn(
             purchase_id=purchase_id,
+            return_type=return_type,
             reason=reason,
             total_amount=total_amount,
+            penalty=penalty,
+            refund_amount=refund_amount,
             status=ReturnStatus.pending,
             created_by=created_by,
         )

@@ -382,7 +382,14 @@ async def adjust_stock(
     *,
     created_by: int,
 ) -> StockMovement:
-    """Manual stock adjustment by an operator."""
+    """
+    Manual stock adjustment by an operator.
+    Also posts a financial transaction so the value of stock changes
+    is reflected in the ledger and P&L reports.
+    """
+    # Fetch item first so we can compute financial value from purchase_price
+    item = await _item_repo.get_or_404(db, body.item_id)
+
     movement = await _apply_stock_change(
         db,
         body.item_id,
@@ -391,11 +398,34 @@ async def adjust_stock(
         note=body.note,
         created_by=created_by,
     )
+
+    # Post financial transaction so adjustment value appears in ledger & P&L
+    from app.services import transaction_service
+    from app.models.enums import TransactionType, ReferenceType
+
+    adjustment_value = abs(body.quantity) * item.purchase_price
+    if adjustment_value > Decimal("0"):
+        is_loss = body.quantity < 0
+        await transaction_service.record_reference_transaction(
+            db,
+            payment_method="adjustment",
+            transaction_type=TransactionType.debit if is_loss else TransactionType.credit,
+            reference_type=ReferenceType.adjustment,
+            reference_id=movement.id,
+            amount=adjustment_value,
+            description=(
+                f"Stock {'loss' if is_loss else 'gain'}: {abs(body.quantity)} × {item.name} "
+                f"@ {item.purchase_price}/unit — {body.note or 'No reason given'}"
+            ),
+            created_by=created_by,
+        )
+
     await audit_service.log(
         db, user_id=created_by, action=AuditAction.UPDATE,
         table_name="items", record_id=body.item_id,
         new_values={
             "adjustment_quantity": str(body.quantity),
+            "adjustment_value": str(adjustment_value),
             "note": body.note,
             "movement_id": movement.id,
         },

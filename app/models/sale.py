@@ -188,6 +188,15 @@ class SaleReturn(Base):
     total_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0, server_default="0"
     )
+    penalty: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
+    refund_amount: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
+    return_type: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="partial", server_default="partial"
+    )
     status: Mapped[ReturnStatus] = mapped_column(
         Enum(ReturnStatus, name="return_status", native_enum=True, create_type=False),
         nullable=False,

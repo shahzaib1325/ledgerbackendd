@@ -98,9 +98,14 @@ async def create_purchase(
     from app.repositories.inventory_repo import ItemRepository
     from app.repositories.supplier_repo import SupplierRepository
 
-    supplier = await SupplierRepository().get_or_404(db, body.supplier_id)
+    supplier_repo = SupplierRepository()
+    supplier = await supplier_repo.get_or_404(db, body.supplier_id)
     if not supplier.is_active:
         raise NotFoundException(f"Supplier {body.supplier_id} not found.")
+
+    # Eagerly load supplier's item catalog for validation
+    await db.refresh(supplier, attribute_names=["items"])
+    supplier_item_ids = {si.item_id for si in supplier.items}
 
     item_repo = ItemRepository()
 
@@ -111,6 +116,14 @@ async def create_purchase(
         inv_item = await item_repo.get_or_404(db, line.item_id)
         if not inv_item.is_active:
             raise NotFoundException(f"Item {line.item_id} not found.")
+
+        # Enforce supplier catalog: if supplier has items defined, line items must belong to it
+        if supplier_item_ids and line.item_id not in supplier_item_ids:
+            raise ValidationException(
+                f"Item '{inv_item.name}' is not in supplier '{supplier.name}' catalog. "
+                f"Add it to the supplier's items list first, or choose a different supplier.",
+                field="item_id",
+            )
 
         total_price = (line.quantity * line.unit_price) - line.discount
         subtotal += total_price
@@ -519,11 +532,17 @@ async def create_return(
             "total_price": total_price,
         })
 
+    penalty = body.penalty
+    refund_amount = max(Decimal("0"), total_amount - penalty)
+
     purchase_return = await _ret_repo.create_return(
         db,
         purchase_id=purchase_id,
+        return_type=body.return_type,
         reason=body.reason,
         total_amount=total_amount,
+        penalty=penalty,
+        refund_amount=refund_amount,
         created_by=created_by,
     )
 
@@ -583,7 +602,11 @@ async def approve_return(
             created_by=approved_by,
         )
 
-    # Reduce supplier payable by return amount
+    # Financial amounts: refund_amount is what supplier actually refunds
+    # (total_amount minus penalty they charge us)
+    refund = purchase_return.refund_amount
+
+    # Reduce supplier payable by refund amount (penalty is absorbed as our expense)
     from app.services.supplier_service import _compute_new_balance
     from app.repositories.supplier_repo import SupplierRepository
     supplier_repo = SupplierRepository()
@@ -593,12 +616,38 @@ async def approve_return(
         new_balance, new_balance_type = _compute_new_balance(
             supplier.balance,
             supplier.balance_type,
-            delta=-purchase_return.total_amount,
+            delta=-refund,
         )
         await supplier_repo.apply_balance_update(
             db, supplier,
             new_balance=new_balance,
             new_balance_type=new_balance_type,
+        )
+
+    # Post financial transactions
+    from app.services import transaction_service
+    from app.models.enums import TransactionType, ReferenceType as RefType
+    if refund > Decimal("0"):
+        await transaction_service.record_reference_transaction(
+            db,
+            payment_method=None,
+            transaction_type=TransactionType.credit,
+            reference_type=RefType.adjustment,
+            reference_id=return_id,
+            amount=refund,
+            description=f"PO-{purchase_id} — purchase return refund",
+            created_by=approved_by,
+        )
+    if purchase_return.penalty > Decimal("0"):
+        await transaction_service.record_reference_transaction(
+            db,
+            payment_method=None,
+            transaction_type=TransactionType.debit,
+            reference_type=RefType.expense,
+            reference_id=return_id,
+            amount=purchase_return.penalty,
+            description=f"PO-{purchase_id} — return penalty/supplier fee",
+            created_by=approved_by,
         )
 
     now = datetime.now(timezone.utc)
@@ -621,6 +670,7 @@ async def reject_return(
     return_id: int,
     *,
     rejected_by: int,
+    rejection_reason: str | None = None,
 ) -> PurchaseReturn:
     """Reject a pending return — no stock or balance changes."""
     purchase_return = await _ret_repo.get_with_items(db, return_id)
@@ -633,6 +683,7 @@ async def reject_return(
 
     old = audit_service.snapshot(purchase_return)
     now = datetime.now(timezone.utc)
+    purchase_return.rejection_reason = rejection_reason
     await _ret_repo.reject(
         db, purchase_return, rejected_by=rejected_by, rejected_at=now
     )

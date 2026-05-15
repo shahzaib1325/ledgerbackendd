@@ -190,20 +190,44 @@ class PurchaseReturnItemCreate(BaseModel):
 
 
 class PurchaseReturnCreate(BaseModel):
+    return_type: Literal["complete", "partial"] = "partial"
     reason: str | None = None
+    penalty: Decimal = Field(default=Decimal("0"), ge=0, decimal_places=2)
     items: list[PurchaseReturnItemCreate] = Field(..., min_length=1)
+
+
+class PurchaseReturnRejectRequest(BaseModel):
+    rejection_reason: str | None = None
+
+
+class PurchaseReturnItemOut(BaseModel):
+    id: int
+    item_id: int
+    quantity: Decimal
+    unit_price: Decimal
+    total_price: Decimal
+
+    model_config = {"from_attributes": True}
 
 
 class PurchaseReturnOut(BaseModel):
     id: int
     purchase_id: int
     return_date: date
+    return_type: str
     reason: str | None
     total_amount: Decimal
+    penalty: Decimal
+    refund_amount: Decimal
     status: ReturnStatus
     approved_by: int | None
     approved_at: datetime | None
+    rejected_by: int | None
+    rejected_at: datetime | None
+    rejection_reason: str | None
+    created_by: int | None
     created_at: datetime
+    return_items: list[PurchaseReturnItemOut] = []
 
     model_config = {"from_attributes": True}
 
