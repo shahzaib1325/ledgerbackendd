@@ -210,6 +210,26 @@ class PurchaseReturnItemOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PurchaseReturnPaymentCreate(BaseModel):
+    amount: Decimal = Field(..., gt=0, decimal_places=2)
+    payment_mode: str = Field(..., min_length=1)
+    reference_no: str | None = None
+    note: str | None = None
+
+
+class PurchaseReturnPaymentOut(BaseModel):
+    id: int
+    return_id: int
+    amount: Decimal
+    payment_mode: str
+    reference_no: str | None
+    note: str | None
+    paid_at: datetime
+    created_by: int | None
+
+    model_config = {"from_attributes": True}
+
+
 class PurchaseReturnOut(BaseModel):
     id: int
     purchase_id: int
@@ -219,6 +239,8 @@ class PurchaseReturnOut(BaseModel):
     total_amount: Decimal
     penalty: Decimal
     refund_amount: Decimal
+    received_amount: Decimal
+    settlement_status: str
     status: ReturnStatus
     approved_by: int | None
     approved_at: datetime | None
@@ -228,6 +250,7 @@ class PurchaseReturnOut(BaseModel):
     created_by: int | None
     created_at: datetime
     return_items: list[PurchaseReturnItemOut] = []
+    payments: list[PurchaseReturnPaymentOut] = []
 
     model_config = {"from_attributes": True}
 

@@ -221,7 +221,10 @@ class SaleReturnRepository:
     ) -> SaleReturn | None:
         result = await db.execute(
             select(SaleReturn)
-            .options(selectinload(SaleReturn.return_items))
+            .options(
+                selectinload(SaleReturn.return_items),
+                selectinload(SaleReturn.payments),
+            )
             .where(SaleReturn.id == return_id)
         )
         return result.scalar_one_or_none()
@@ -231,9 +234,33 @@ class SaleReturnRepository:
     ) -> list[SaleReturn]:
         result = await db.execute(
             select(SaleReturn)
-            .options(selectinload(SaleReturn.return_items))
+            .options(
+                selectinload(SaleReturn.return_items),
+                selectinload(SaleReturn.payments),
+            )
             .where(SaleReturn.invoice_id == invoice_id)
             .order_by(desc(SaleReturn.created_at))
+        )
+        return list(result.scalars().all())
+
+    async def list_approved_partial(
+        self, db: AsyncSession, *, limit: int = 50
+    ) -> list[SaleReturn]:
+        """List approved partial returns (for display as separate rows in sales list)."""
+        from app.models.sale import SaleInvoice
+        result = await db.execute(
+            select(SaleReturn)
+            .join(SaleInvoice, SaleInvoice.id == SaleReturn.invoice_id)
+            .where(
+                SaleReturn.status == ReturnStatus.approved,
+                SaleInvoice.status != SaleStatus.returned,
+            )
+            .options(
+                selectinload(SaleReturn.return_items),
+                selectinload(SaleReturn.payments),
+            )
+            .order_by(desc(SaleReturn.created_at))
+            .limit(limit)
         )
         return list(result.scalars().all())
 

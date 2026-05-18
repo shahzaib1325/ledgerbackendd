@@ -196,9 +196,19 @@ class PurchaseReturn(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    received_amount: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
+    settlement_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unsettled", server_default="unsettled"
+    )
+
     # ── Relationships ─────────────────────────────────────────────────────────
     purchase: Mapped["Purchase"] = relationship(back_populates="returns")
     return_items: Mapped[list["PurchaseReturnItem"]] = relationship(
+        back_populates="purchase_return", cascade="all, delete-orphan"
+    )
+    payments: Mapped[list["PurchaseReturnPayment"]] = relationship(
         back_populates="purchase_return", cascade="all, delete-orphan"
     )
 
@@ -220,3 +230,25 @@ class PurchaseReturnItem(Base):
     # ── Relationships ─────────────────────────────────────────────────────────
     purchase_return: Mapped["PurchaseReturn"] = relationship(back_populates="return_items")
     item: Mapped["Item"] = relationship(foreign_keys=[item_id])  # type: ignore[name-defined]
+
+
+class PurchaseReturnPayment(Base):
+    __tablename__ = "purchase_return_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    return_id: Mapped[int] = mapped_column(
+        ForeignKey("purchase_returns.id", ondelete="CASCADE"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    payment_mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    reference_no: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    paid_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    created_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # ── Relationships ─────────────────────────────────────────────────────────
+    purchase_return: Mapped["PurchaseReturn"] = relationship(back_populates="payments")

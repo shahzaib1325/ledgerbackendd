@@ -233,6 +233,26 @@ class SaleReturnRejectRequest(BaseModel):
     rejection_reason: str | None = None
 
 
+class SaleReturnPaymentCreate(BaseModel):
+    amount: Decimal = Field(..., gt=0, decimal_places=2)
+    payment_mode: str = Field(..., min_length=1)
+    reference_no: str | None = None
+    note: str | None = None
+
+
+class SaleReturnPaymentOut(BaseModel):
+    id: int
+    return_id: int
+    amount: Decimal
+    payment_mode: str
+    reference_no: str | None
+    note: str | None
+    paid_at: datetime
+    created_by: int | None
+
+    model_config = {"from_attributes": True}
+
+
 class SaleReturnOut(BaseModel):
     id: int
     invoice_id: int
@@ -242,6 +262,8 @@ class SaleReturnOut(BaseModel):
     total_amount: Decimal
     penalty: Decimal
     refund_amount: Decimal
+    received_amount: Decimal
+    settlement_status: str
     status: ReturnStatus
     approved_by: int | None
     approved_at: datetime | None
@@ -251,6 +273,7 @@ class SaleReturnOut(BaseModel):
     created_by: int | None
     created_at: datetime
     return_items: list[SaleReturnItemOut] = []
+    payments: list[SaleReturnPaymentOut] = []
 
     model_config = {"from_attributes": True}
 

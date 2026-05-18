@@ -4,11 +4,13 @@ from app.api.v1.endpoints import (
     audit,
     auth,
     customers,
+    dashboard,
     inventory,
     production,
     purchases,
     reports,
     sales,
+    search,
     staff,
     suppliers,
     transactions,
@@ -27,3 +29,5 @@ api_v1_router.include_router(staff.router, prefix="/staff", tags=["Staff"])
 api_v1_router.include_router(production.router, prefix="/production", tags=["Production"])
 api_v1_router.include_router(reports.router, prefix="/reports", tags=["Reports"])
 api_v1_router.include_router(audit.router, prefix="/audit-logs", tags=["Audit"])
+api_v1_router.include_router(dashboard.router, prefix="", tags=["Dashboard"])
+api_v1_router.include_router(search.router, prefix="", tags=["Search"])

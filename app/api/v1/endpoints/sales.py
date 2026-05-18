@@ -42,6 +42,7 @@ from app.schemas.sale import (
     SaleReturnCreate,
     SaleReturnOut,
     SaleReturnRejectRequest,
+    SaleReturnPaymentCreate,
     SaleSortField,
     SaleUpdate,
     SortOrder,
@@ -282,3 +283,32 @@ async def reject_return(
     )
     await db.commit()
     return SuccessResponse(data=SaleReturnOut.model_validate(sale_return))
+
+
+@router.get("/returns/approved", summary="List approved partial returns (for list view)")
+async def list_approved_returns(
+    db: DbDep,
+    _: ReadDep,
+    limit: int = Query(50, ge=1, le=100),
+) -> SuccessResponse[list[SaleReturnOut]]:
+    returns = await sale_service.list_approved_partial_returns(db, limit=limit)
+    return SuccessResponse(data=[SaleReturnOut.model_validate(r) for r in returns])
+
+
+@router.post(
+    "/{invoice_id}/returns/{return_id}/payments",
+    status_code=status.HTTP_201_CREATED,
+    summary="Record a refund payment to customer for an approved return",
+)
+async def record_return_payment(
+    invoice_id: int,
+    return_id: int,
+    body: SaleReturnPaymentCreate,
+    db: DbDep,
+    current_user: WriteDep,
+) -> SuccessResponse[SaleReturnOut]:
+    updated = await sale_service.record_return_payment(
+        db, invoice_id, return_id, body, created_by=current_user.id
+    )
+    await db.commit()
+    return SuccessResponse(data=SaleReturnOut.model_validate(updated))

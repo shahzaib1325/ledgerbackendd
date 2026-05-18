@@ -16,10 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.reports import (
     AccountCashFlowRow,
+    ActivityLedgerReport,
+    ActivityRow,
     CashFlowReport,
     CustomerBalanceReport,
     CustomerBalanceRow,
     CustomerSalesRow,
+    EntityBlock,
+    EntitySummary,
     PayrollSummaryReport,
     PayrollSummaryRow,
     ProductionSummaryReport,
@@ -639,4 +643,355 @@ async def production_summary(
         total_orders=len(prod_rows),
         completed_orders=sum(1 for r in prod_rows if r.status.value == "completed"),
         total_production_cost=sum(r.total_cost for r in prod_rows),
+    )
+
+
+# ── Activity Ledger ──────────────────────────────────────────────────────────
+
+async def activity_ledger(
+    db: AsyncSession,
+    date_from: date,
+    date_to: date,
+    *,
+    entity_type: str | None = None,    # supplier | customer | staff | None=all
+    entity_id: int | None = None,
+    activity_type: str | None = None,  # purchase | sale | payment | return | salary | attendance | production | None=all
+    page: int = 1,
+    limit: int = 20,
+) -> ActivityLedgerReport:
+    """
+    Unified activity ledger — one query per activity source, grouped by entity.
+    """
+    from collections import defaultdict
+
+    # entity_key → { entity info + activities list }
+    entities: dict[str, dict] = {}
+
+    def _ensure_entity(etype: str, eid: int, name: str, phone: str | None, meta: dict) -> str:
+        key = f"{etype}-{eid}"
+        if key not in entities:
+            entities[key] = {
+                "entity_type": etype,
+                "entity_id": eid,
+                "entity_name": name,
+                "phone": phone,
+                "meta": meta,
+                "activities": [],
+                "total_amount": Decimal("0"),
+                "total_paid": Decimal("0"),
+                "total_returns": Decimal("0"),
+            }
+        return key
+
+    date_filter = "BETWEEN :d1 AND :d2"
+    params: dict = {"d1": date_from, "d2": date_to}
+
+    # ── Supplier activities ───────────────────────────────────────────────
+    if entity_type in (None, "supplier"):
+        # Purchases
+        if activity_type in (None, "purchase"):
+            q = f"""
+                SELECT p.id, p.supplier_id, s.name, s.phone, s.balance, s.balance_type,
+                       p.invoice_no, p.purchase_date, p.total_amount, p.paid_amount, p.status
+                FROM purchases p
+                JOIN suppliers s ON s.id = p.supplier_id
+                WHERE p.purchase_date {date_filter}
+                  AND p.status NOT IN ('void')
+            """
+            if entity_id:
+                q += " AND p.supplier_id = :eid"
+                params["eid"] = entity_id
+            q += " ORDER BY p.purchase_date"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("supplier", r["supplier_id"], r["name"], r["phone"],
+                    {"balance": str(r["balance"]), "balance_type": r["balance_type"]})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["purchase_date"]), activity_type="purchase",
+                    reference=r["invoice_no"] or f"PO #{r['id']}",
+                    description=f"Purchase — {r['status']}",
+                    amount=r["total_amount"], reference_id=r["id"],
+                ))
+                entities[key]["total_amount"] += r["total_amount"]
+
+        # Supplier payments
+        if activity_type in (None, "payment"):
+            q = f"""
+                SELECT sp.id, sp.supplier_id, s.name, s.phone, s.balance, s.balance_type,
+                       sp.amount, sp.payment_mode, sp.paid_at::date as pay_date, sp.reference_no
+                FROM supplier_payments sp
+                JOIN suppliers s ON s.id = sp.supplier_id
+                WHERE sp.paid_at::date {date_filter}
+            """
+            if entity_id:
+                q += " AND sp.supplier_id = :eid"
+            q += " ORDER BY sp.paid_at"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("supplier", r["supplier_id"], r["name"], r["phone"],
+                    {"balance": str(r["balance"]), "balance_type": r["balance_type"]})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["pay_date"]), activity_type="payment_out",
+                    reference=r["reference_no"] or f"PAY #{r['id']}",
+                    description=f"Payment to supplier — {r['payment_mode']}",
+                    amount=r["amount"], reference_id=r["id"],
+                ))
+                entities[key]["total_paid"] += r["amount"]
+
+        # Purchase returns
+        if activity_type in (None, "return"):
+            q = f"""
+                SELECT pr.id, p.supplier_id, s.name, s.phone, s.balance, s.balance_type,
+                       pr.return_date, pr.refund_amount, pr.status as ret_status, p.invoice_no
+                FROM purchase_returns pr
+                JOIN purchases p ON p.id = pr.purchase_id
+                JOIN suppliers s ON s.id = p.supplier_id
+                WHERE pr.return_date {date_filter} AND pr.status = 'approved'
+            """
+            if entity_id:
+                q += " AND p.supplier_id = :eid"
+            q += " ORDER BY pr.return_date"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("supplier", r["supplier_id"], r["name"], r["phone"],
+                    {"balance": str(r["balance"]), "balance_type": r["balance_type"]})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["return_date"]), activity_type="purchase_return",
+                    reference=f"RET #{r['id']} ({r['invoice_no']})",
+                    description="Purchase return approved",
+                    amount=-r["refund_amount"], reference_id=r["id"],
+                ))
+                entities[key]["total_returns"] += r["refund_amount"]
+
+    # ── Customer activities ───────────────────────────────────────────────
+    if entity_type in (None, "customer"):
+        # Sales
+        if activity_type in (None, "sale"):
+            q = f"""
+                SELECT si.id, si.customer_id, c.name, c.phone, c.balance, c.balance_type, c.credit_limit,
+                       si.invoice_no, si.invoice_date, si.total_amount, si.paid_amount, si.status
+                FROM sale_invoices si
+                LEFT JOIN customers c ON c.id = si.customer_id
+                WHERE si.invoice_date {date_filter}
+                  AND si.status NOT IN ('void')
+                  AND si.customer_id IS NOT NULL
+            """
+            if entity_id:
+                q += " AND si.customer_id = :eid"
+                params["eid"] = entity_id
+            q += " ORDER BY si.invoice_date"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("customer", r["customer_id"], r["name"] or "Walk-in", r["phone"],
+                    {"balance": str(r["balance"] or 0), "balance_type": r["balance_type"] or "receivable",
+                     "credit_limit": str(r["credit_limit"] or 0)})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["invoice_date"]), activity_type="sale",
+                    reference=r["invoice_no"] or f"INV #{r['id']}",
+                    description=f"Sale — {r['status']}",
+                    amount=r["total_amount"], reference_id=r["id"],
+                ))
+                entities[key]["total_amount"] += r["total_amount"]
+
+        # Customer payments received
+        if activity_type in (None, "payment"):
+            q = f"""
+                SELECT cp.id, cp.invoice_id, si.customer_id, c.name, c.phone, c.balance, c.balance_type, c.credit_limit,
+                       cp.amount, cp.payment_mode, cp.received_at::date as pay_date, cp.reference_no
+                FROM sale_payments cp
+                JOIN sale_invoices si ON si.id = cp.invoice_id
+                LEFT JOIN customers c ON c.id = si.customer_id
+                WHERE cp.received_at::date {date_filter} AND si.customer_id IS NOT NULL
+            """
+            if entity_id:
+                q += " AND si.customer_id = :eid"
+            q += " ORDER BY cp.received_at"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("customer", r["customer_id"], r["name"] or "Walk-in", r["phone"],
+                    {"balance": str(r["balance"] or 0), "balance_type": r["balance_type"] or "receivable",
+                     "credit_limit": str(r["credit_limit"] or 0)})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["pay_date"]), activity_type="payment_in",
+                    reference=r["reference_no"] or f"RCPT #{r['id']}",
+                    description=f"Payment received — {r['payment_mode']}",
+                    amount=r["amount"], reference_id=r["id"],
+                ))
+                entities[key]["total_paid"] += r["amount"]
+
+        # Sale returns
+        if activity_type in (None, "return"):
+            q = f"""
+                SELECT sr.id, si.customer_id, c.name, c.phone, c.balance, c.balance_type, c.credit_limit,
+                       sr.return_date, sr.refund_amount, si.invoice_no
+                FROM sale_returns sr
+                JOIN sale_invoices si ON si.id = sr.invoice_id
+                LEFT JOIN customers c ON c.id = si.customer_id
+                WHERE sr.return_date {date_filter} AND sr.status = 'approved' AND si.customer_id IS NOT NULL
+            """
+            if entity_id:
+                q += " AND si.customer_id = :eid"
+            q += " ORDER BY sr.return_date"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("customer", r["customer_id"], r["name"] or "Walk-in", r["phone"],
+                    {"balance": str(r["balance"] or 0), "balance_type": r["balance_type"] or "receivable",
+                     "credit_limit": str(r["credit_limit"] or 0)})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["return_date"]), activity_type="sale_return",
+                    reference=f"RET #{r['id']} ({r['invoice_no']})",
+                    description="Sale return approved",
+                    amount=-r["refund_amount"], reference_id=r["id"],
+                ))
+                entities[key]["total_returns"] += r["refund_amount"]
+
+    # ── Staff activities ──────────────────────────────────────────────────
+    if entity_type in (None, "staff"):
+        # Salary payments
+        if activity_type in (None, "salary"):
+            q = f"""
+                SELECT sp.id, sp.staff_id, st.name, st.phone, st.department, st.designation,
+                       st.compensation_type, sp.net_salary, sp.payment_month, sp.payment_year,
+                       sp.paid_at::date as pay_date
+                FROM staff_payments sp
+                JOIN staff st ON st.id = sp.staff_id
+                WHERE sp.paid_at::date {date_filter}
+            """
+            if entity_id:
+                q += " AND sp.staff_id = :eid"
+                params["eid"] = entity_id
+            q += " ORDER BY sp.paid_at"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("staff", r["staff_id"], r["name"], r["phone"],
+                    {"department": r["department"] or "", "designation": r["designation"] or "",
+                     "compensation_type": r["compensation_type"]})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["pay_date"]), activity_type="salary",
+                    reference=f"SAL #{r['id']}",
+                    description=f"Salary — {r['payment_month']}/{r['payment_year']}",
+                    amount=r["net_salary"], reference_id=r["id"],
+                ))
+                entities[key]["total_paid"] += r["net_salary"]
+
+        # Advances
+        if activity_type in (None, "salary"):
+            q = f"""
+                SELECT a.id, a.staff_id, st.name, st.phone, st.department, st.designation,
+                       st.compensation_type, a.amount, a.reason, a.paid_at::date as pay_date
+                FROM advances a
+                JOIN staff st ON st.id = a.staff_id
+                WHERE a.paid_at::date {date_filter}
+            """
+            if entity_id:
+                q += " AND a.staff_id = :eid"
+            q += " ORDER BY a.paid_at"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("staff", r["staff_id"], r["name"], r["phone"],
+                    {"department": r["department"] or "", "designation": r["designation"] or "",
+                     "compensation_type": r["compensation_type"]})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["pay_date"]), activity_type="advance",
+                    reference=f"ADV #{r['id']}",
+                    description=f"Advance — {r['reason'] or 'No reason'}",
+                    amount=r["amount"], reference_id=r["id"],
+                ))
+
+        # Attendance
+        if activity_type in (None, "attendance"):
+            q = f"""
+                SELECT att.id, att.staff_id, st.name, st.phone, st.department, st.designation,
+                       st.compensation_type, att.date, att.status, att.notes
+                FROM attendance att
+                JOIN staff st ON st.id = att.staff_id
+                WHERE att.date {date_filter}
+            """
+            if entity_id:
+                q += " AND att.staff_id = :eid"
+            q += " ORDER BY att.date"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("staff", r["staff_id"], r["name"], r["phone"],
+                    {"department": r["department"] or "", "designation": r["designation"] or "",
+                     "compensation_type": r["compensation_type"]})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["date"]), activity_type="attendance",
+                    reference=f"ATT-{r['date']}",
+                    description=f"Attendance — {r['status']}" + (f" ({r['notes']})" if r["notes"] else ""),
+                    amount=None, reference_id=r["id"],
+                ))
+
+        # Production labor
+        if activity_type in (None, "production"):
+            q = f"""
+                SELECT pl.id, pl.staff_id, st.name, st.phone, st.department, st.designation,
+                       st.compensation_type, pl.quantity_produced, pl.total_cost,
+                       po.order_no, po.end_date
+                FROM production_labor pl
+                JOIN staff st ON st.id = pl.staff_id
+                JOIN production_orders po ON po.id = pl.order_id
+                WHERE po.status = 'completed' AND po.end_date {date_filter}
+            """
+            if entity_id:
+                q += " AND pl.staff_id = :eid"
+            q += " ORDER BY po.end_date"
+            rows = await db.execute(text(q), params)
+            for r in rows.mappings().all():
+                key = _ensure_entity("staff", r["staff_id"], r["name"], r["phone"],
+                    {"department": r["department"] or "", "designation": r["designation"] or "",
+                     "compensation_type": r["compensation_type"]})
+                entities[key]["activities"].append(ActivityRow(
+                    date=str(r["end_date"]),  activity_type="production",
+                    reference=r["order_no"],
+                    description=f"Production — {r['quantity_produced']} units",
+                    amount=r["total_cost"], reference_id=r["id"],
+                ))
+
+    # ── Build response ────────────────────────────────────────────────────
+
+    entity_blocks: list[EntityBlock] = []
+    grand_amount = Decimal("0")
+    grand_paid = Decimal("0")
+
+    for data in entities.values():
+        # Sort activities by date
+        data["activities"].sort(key=lambda a: a.date)
+        entity_blocks.append(EntityBlock(
+            entity_type=data["entity_type"],
+            entity_id=data["entity_id"],
+            entity_name=data["entity_name"],
+            phone=data["phone"],
+            meta=data["meta"],
+            summary=EntitySummary(
+                total_transactions=len(data["activities"]),
+                total_amount=data["total_amount"],
+                total_paid=data["total_paid"],
+                total_returns=data["total_returns"],
+            ),
+            activities=data["activities"],
+        ))
+        grand_amount += data["total_amount"]
+        grand_paid += data["total_paid"]
+
+    # Sort entities: suppliers first, then customers, then staff
+    type_order = {"supplier": 0, "customer": 1, "staff": 2}
+    entity_blocks.sort(key=lambda e: (type_order.get(e.entity_type, 9), e.entity_name))
+
+    # Paginate entities (grand totals reflect ALL entities, not just current page)
+    total_entities = len(entity_blocks)
+    start = (page - 1) * limit
+    paginated_blocks = entity_blocks[start : start + limit]
+
+    return ActivityLedgerReport(
+        date_from=date_from,
+        date_to=date_to,
+        entity_type_filter=entity_type,
+        activity_type_filter=activity_type,
+        entities=paginated_blocks,
+        total_entities=total_entities,
+        page=page,
+        page_size=limit,
+        grand_total_amount=grand_amount,
+        grand_total_paid=grand_paid,
     )

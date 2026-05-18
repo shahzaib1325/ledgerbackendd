@@ -90,10 +90,10 @@ async def create_purchase(
     created_by: int,
 ) -> Purchase:
     """
-    Create a purchase in draft status.
+    Create a purchase as confirmed.
 
-    Totals are computed here; stock and supplier balance are NOT touched
-    until the purchase is confirmed.
+    Stock is received, supplier balance updated, and transactions posted
+    immediately at creation time. No draft step.
     """
     from app.repositories.inventory_repo import ItemRepository
     from app.repositories.supplier_repo import SupplierRepository
@@ -118,7 +118,13 @@ async def create_purchase(
             raise NotFoundException(f"Item {line.item_id} not found.")
 
         # Enforce supplier catalog: if supplier has items defined, line items must belong to it
-        if supplier_item_ids and line.item_id not in supplier_item_ids:
+        if not supplier_item_ids:
+            raise ValidationException(
+                f"Supplier '{supplier.name}' has no items assigned. "
+                f"Add items to the supplier's catalog before creating a purchase.",
+                field="supplier_id",
+            )
+        if line.item_id not in supplier_item_ids:
             raise ValidationException(
                 f"Item '{inv_item.name}' is not in supplier '{supplier.name}' catalog. "
                 f"Add it to the supplier's items list first, or choose a different supplier.",
@@ -162,9 +168,11 @@ async def create_purchase(
             "overhead_cost": overhead,
             "total_amount": total_amount,
             "paid_amount": paid_amount,
-            "status": PurchaseStatus.draft,
+            "status": PurchaseStatus.confirmed,
             "notes": body.notes,
             "created_by": created_by,
+            "confirmed_by": created_by,
+            "confirmed_at": datetime.now(timezone.utc),
         },
     )
 
@@ -179,6 +187,54 @@ async def create_purchase(
 
     await db.flush()
     await db.refresh(purchase, ["due_amount", "updated_at"])
+
+    # ── Stock in + price update for each line item ───────────────────────────
+    from app.services import inventory_service, supplier_service, transaction_service
+    from app.models.enums import TransactionType, ReferenceType
+
+    for line in line_data:
+        await inventory_service.record_purchase_in(
+            db, line["item_id"], line["quantity"],
+            reference_id=purchase.id, created_by=created_by,
+        )
+        await inventory_service.update_purchase_price(
+            db, line["item_id"], new_price=line["unit_price"],
+        )
+
+    # ── Supplier balance ─────────────────────────────────────────────────────
+    if purchase.payment_type in (PaymentType.credit, PaymentType.partial):
+        await supplier_service.apply_purchase_to_balance(
+            db, purchase.supplier_id, purchase_amount=purchase.due_amount,
+        )
+
+    # ── Transactions ─────────────────────────────────────────────────────────
+    await transaction_service.record_reference_transaction(
+        db, payment_method=None,
+        transaction_type=TransactionType.debit,
+        reference_type=ReferenceType.purchase,
+        reference_id=purchase.id, amount=purchase.total_amount,
+        description=f"{purchase.invoice_no} — purchase invoiced",
+        created_by=created_by,
+    )
+    if purchase.payment_type == PaymentType.cash:
+        await transaction_service.record_reference_transaction(
+            db, payment_method="cash",
+            transaction_type=TransactionType.debit,
+            reference_type=ReferenceType.purchase_payment,
+            reference_id=purchase.id, amount=purchase.total_amount,
+            description=f"{purchase.invoice_no} — cash paid",
+            created_by=created_by,
+        )
+    elif purchase.payment_type == PaymentType.partial and purchase.paid_amount > 0:
+        await transaction_service.record_reference_transaction(
+            db, payment_method="cash",
+            transaction_type=TransactionType.debit,
+            reference_type=ReferenceType.purchase_payment,
+            reference_id=purchase.id, amount=purchase.paid_amount,
+            description=f"{purchase.invoice_no} — partial payment upfront",
+            created_by=created_by,
+        )
+
     result = await _repo.get_with_items(db, purchase.id)
     await audit_service.log(
         db, user_id=created_by, action=AuditAction.CREATE,
@@ -236,7 +292,7 @@ async def update_purchase(
     purchase = await _repo.get_with_items(db, purchase_id)
     if purchase is None:
         raise NotFoundException(f"Purchase {purchase_id} not found.")
-    _assert_status(purchase, PurchaseStatus.draft, action="update")
+    _assert_status(purchase, PurchaseStatus.confirmed, action="update")
 
     old = audit_service.snapshot(purchase)
 
@@ -245,9 +301,15 @@ async def update_purchase(
         await _repo.update(db, purchase, patch)
 
     if body.items is not None:
-        # Delete existing line items
+        from app.services import inventory_service
+
+        # Reverse stock for old line items
         existing = await _item_repo.get_for_purchase(db, purchase_id)
         for item in existing:
+            await inventory_service.record_return_out(
+                db, item.item_id, item.quantity,
+                reference_id=purchase_id, created_by=updated_by,
+            )
             await db.delete(item)
         await db.flush()
 
@@ -272,6 +334,16 @@ async def update_purchase(
             })
         await _item_repo.bulk_create(db, line_data)
 
+        # Apply stock in for new line items
+        for line in line_data:
+            await inventory_service.record_purchase_in(
+                db, line["item_id"], line["quantity"],
+                reference_id=purchase_id, created_by=updated_by,
+            )
+            await inventory_service.update_purchase_price(
+                db, line["item_id"], new_price=line["unit_price"],
+            )
+
         header_discount = body.discount if body.discount is not None else purchase.discount
         total_amount = max(Decimal("0"), subtotal - header_discount + purchase.overhead_cost)
         await _repo.update_totals(
@@ -281,8 +353,29 @@ async def update_purchase(
             total_amount=total_amount,
         )
 
+    # ── Reverse and reapply supplier balance if financials changed ──────────
+    from app.services import supplier_service
+
+    old_pt = purchase.payment_type
+    old_due = purchase.due_amount if hasattr(purchase, 'due_amount') else (purchase.total_amount - purchase.paid_amount)
+    old_bal = old_due if old_pt in (PaymentType.credit, PaymentType.partial) else Decimal("0")
+
     await db.flush()
-    await db.refresh(purchase, ["due_amount", "updated_at"])
+    await db.refresh(purchase, ["due_amount", "updated_at", "total_amount", "paid_amount"])
+
+    new_due = purchase.due_amount if hasattr(purchase, 'due_amount') else (purchase.total_amount - purchase.paid_amount)
+    new_bal = new_due if purchase.payment_type in (PaymentType.credit, PaymentType.partial) else Decimal("0")
+
+    if old_bal != new_bal:
+        if old_bal > 0:
+            await supplier_service.apply_purchase_to_balance(
+                db, purchase.supplier_id, purchase_amount=-old_bal,
+            )
+        if new_bal > 0:
+            await supplier_service.apply_purchase_to_balance(
+                db, purchase.supplier_id, purchase_amount=new_bal,
+            )
+
     updated = await _repo.get_with_items(db, purchase_id)
     await audit_service.log(
         db, user_id=updated_by, action=AuditAction.UPDATE,
@@ -394,11 +487,47 @@ async def confirm_purchase(
 # ── Void (draft only) ─────────────────────────────────────────────────────────
 
 async def void_purchase(db: AsyncSession, purchase_id: int, *, voided_by: int) -> Purchase:
+    """
+    Void a purchase. Reverses stock and supplier balance if confirmed.
+    """
+    from app.services import inventory_service, supplier_service
+    from app.repositories.supplier_repo import SupplierRepository
+
     purchase = await _repo.get_with_items(db, purchase_id)
     if purchase is None:
         raise NotFoundException(f"Purchase {purchase_id} not found.")
-    _assert_status(purchase, PurchaseStatus.draft, action="void")
+    _assert_status(purchase, PurchaseStatus.confirmed, action="void")
+
     old = audit_service.snapshot(purchase)
+
+    # Reverse stock: remove items from inventory
+    from app.repositories.inventory_repo import ItemRepository
+    item_repo = ItemRepository()
+    for line in purchase.items:
+        inv_item = await item_repo.get_or_404(db, line.item_id)
+        if inv_item.current_stock < line.quantity:
+            raise ValidationException(
+                f"Cannot void: Insufficient stock for '{inv_item.name}'. "
+                f"Available: {inv_item.current_stock}, Need to reverse: {line.quantity}"
+            )
+        await inventory_service.record_return_out(
+            db, line.item_id, line.quantity,
+            reference_id=purchase.id, created_by=voided_by,
+        )
+
+    # Reverse supplier balance
+    if purchase.payment_type in (PaymentType.credit, PaymentType.partial):
+        from app.services.supplier_service import _compute_new_balance
+        supplier_repo = SupplierRepository()
+        supplier = await supplier_repo.get_with_lock(db, purchase.supplier_id)
+        if supplier and supplier.is_active:
+            new_balance, new_balance_type = _compute_new_balance(
+                supplier.balance, supplier.balance_type, delta=-purchase.due_amount,
+            )
+            await supplier_repo.apply_balance_update(
+                db, supplier, new_balance=new_balance, new_balance_type=new_balance_type,
+            )
+
     await _repo.set_status(db, purchase, status=PurchaseStatus.void)
     await db.flush()
     voided = await _repo.get_with_items(db, purchase_id)
@@ -602,58 +731,25 @@ async def approve_return(
             created_by=approved_by,
         )
 
-    # Financial amounts: refund_amount is what supplier actually refunds
-    # (total_amount minus penalty they charge us)
-    refund = purchase_return.refund_amount
-
-    # Reduce supplier payable by refund amount (penalty is absorbed as our expense)
-    from app.services.supplier_service import _compute_new_balance
-    from app.repositories.supplier_repo import SupplierRepository
-    supplier_repo = SupplierRepository()
-    purchase = await _repo.get_with_lock(db, purchase_id)
-    supplier = await supplier_repo.get_with_lock(db, purchase.supplier_id)
-    if supplier and supplier.is_active:
-        new_balance, new_balance_type = _compute_new_balance(
-            supplier.balance,
-            supplier.balance_type,
-            delta=-refund,
-        )
-        await supplier_repo.apply_balance_update(
-            db, supplier,
-            new_balance=new_balance,
-            new_balance_type=new_balance_type,
-        )
-
-    # Post financial transactions
-    from app.services import transaction_service
-    from app.models.enums import TransactionType, ReferenceType as RefType
-    if refund > Decimal("0"):
-        await transaction_service.record_reference_transaction(
-            db,
-            payment_method=None,
-            transaction_type=TransactionType.credit,
-            reference_type=RefType.adjustment,
-            reference_id=return_id,
-            amount=refund,
-            description=f"PO-{purchase_id} — purchase return refund",
-            created_by=approved_by,
-        )
-    if purchase_return.penalty > Decimal("0"):
-        await transaction_service.record_reference_transaction(
-            db,
-            payment_method=None,
-            transaction_type=TransactionType.debit,
-            reference_type=RefType.expense,
-            reference_id=return_id,
-            amount=purchase_return.penalty,
-            description=f"PO-{purchase_id} — return penalty/supplier fee",
-            created_by=approved_by,
-        )
+    # Approval only moves stock. Financial balance changes happen when
+    # return payments are recorded (same as purchase payment lifecycle).
 
     now = datetime.now(timezone.utc)
     await _ret_repo.approve(
         db, purchase_return, approved_by=approved_by, approved_at=now
     )
+
+    # Full return: mark purchase as "returned"
+    purchase = await _repo.get_with_lock(db, purchase_id)
+    total_approved_returns = sum(
+        r.total_amount
+        for r in await _ret_repo.list_for_purchase(db, purchase_id)
+        if r.status == ReturnStatus.approved
+    )
+    if total_approved_returns >= purchase.total_amount:
+        purchase.status = PurchaseStatus.returned
+        db.add(purchase)
+
     await db.flush()
     approved = await _ret_repo.get_with_items(db, return_id)
     await audit_service.log(
@@ -704,3 +800,88 @@ async def list_returns(
     if purchase is None:
         raise NotFoundException(f"Purchase {purchase_id} not found.")
     return await _ret_repo.list_for_purchase(db, purchase_id)
+
+
+async def list_approved_partial_returns(
+    db: AsyncSession, *, limit: int = 50
+) -> list[PurchaseReturn]:
+    """List approved partial returns globally (for display in purchase list)."""
+    return await _ret_repo.list_approved_partial(db, limit=limit)
+
+
+async def record_return_payment(
+    db: AsyncSession,
+    purchase_id: int,
+    return_id: int,
+    body,
+    *,
+    created_by: int,
+) -> PurchaseReturn:
+    """
+    Record a refund payment from the supplier for an approved return.
+    Updates received_amount and settlement_status. Adjusts supplier balance.
+    """
+    from app.models.purchase import PurchaseReturnPayment
+    from app.services import transaction_service
+    from app.services.supplier_service import _compute_new_balance
+    from app.repositories.supplier_repo import SupplierRepository
+    from app.models.enums import TransactionType, ReferenceType as RefType
+
+    purchase_return = await _ret_repo.get_with_items(db, return_id)
+    if purchase_return is None or purchase_return.purchase_id != purchase_id:
+        raise NotFoundException(f"Return {return_id} not found.")
+    if purchase_return.status != ReturnStatus.approved:
+        raise ValidationException("Can only record payments for approved returns.")
+
+    refund_due = purchase_return.refund_amount - purchase_return.received_amount
+    if body.amount > refund_due:
+        raise ValidationException(
+            f"Payment amount ({body.amount}) exceeds remaining refund due ({refund_due})."
+        )
+
+    # Record the payment row
+    payment = PurchaseReturnPayment(
+        return_id=return_id,
+        amount=body.amount,
+        payment_mode=body.payment_mode,
+        reference_no=body.reference_no,
+        note=body.note,
+        created_by=created_by,
+    )
+    db.add(payment)
+
+    # Update return settlement
+    new_received = purchase_return.received_amount + body.amount
+    purchase_return.received_amount = new_received
+    if new_received >= purchase_return.refund_amount:
+        purchase_return.settlement_status = "settled"
+    else:
+        purchase_return.settlement_status = "partially_settled"
+    db.add(purchase_return)
+
+    # Adjust supplier balance
+    supplier_repo = SupplierRepository()
+    purchase = await _repo.get_with_lock(db, purchase_id)
+    supplier = await supplier_repo.get_with_lock(db, purchase.supplier_id)
+    if supplier and supplier.is_active:
+        new_balance, new_balance_type = _compute_new_balance(
+            supplier.balance, supplier.balance_type, delta=-body.amount,
+        )
+        await supplier_repo.apply_balance_update(
+            db, supplier, new_balance=new_balance, new_balance_type=new_balance_type,
+        )
+
+    # Post financial transaction
+    await transaction_service.record_reference_transaction(
+        db,
+        payment_method=body.payment_mode,
+        transaction_type=TransactionType.credit,
+        reference_type=RefType.adjustment,
+        reference_id=return_id,
+        amount=body.amount,
+        description=f"PO-{purchase_id} — return refund payment ({body.payment_mode})",
+        created_by=created_by,
+    )
+
+    await db.flush()
+    return await _ret_repo.get_with_items(db, return_id)

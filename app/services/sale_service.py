@@ -108,10 +108,10 @@ async def create_sale(
     created_by: int,
 ) -> SaleInvoice:
     """
-    Create a sale invoice in draft status.
+    Create a sale invoice as confirmed.
 
-    Totals are computed here; stock and customer balance are NOT touched
-    until the invoice is confirmed.
+    Stock is deducted, customer balance updated, and transactions posted
+    immediately at creation time. No draft step.
     """
     from app.repositories.inventory_repo import ItemRepository
     from app.repositories.customer_repo import CustomerRepository
@@ -190,9 +190,11 @@ async def create_sale(
             "tax": tax,
             "total_amount": total_amount,
             "paid_amount": paid_amount,
-            "status": SaleStatus.draft,
+            "status": SaleStatus.paid if body.payment_type == PaymentType.cash else SaleStatus.confirmed,
             "notes": body.notes,
             "created_by": created_by,
+            "confirmed_by": created_by,
+            "confirmed_at": datetime.now(timezone.utc),
         },
     )
 
@@ -206,6 +208,56 @@ async def create_sale(
 
     await db.flush()
     await db.refresh(invoice, ["due_amount", "updated_at"])
+
+    # ── Stock out for each line item ─────────────────────────────────────────
+    from app.services import inventory_service, customer_service, transaction_service
+    from app.models.enums import TransactionType, ReferenceType
+
+    for line in line_data:
+        await inventory_service.record_sale_out(
+            db, line["item_id"], line["quantity"],
+            reference_id=invoice.id, created_by=created_by,
+        )
+
+    # ── Customer balance ─────────────────────────────────────────────────────
+    if invoice.customer_id and invoice.payment_type in (PaymentType.credit, PaymentType.partial):
+        balance_amount = (
+            invoice.total_amount - invoice.paid_amount
+            if invoice.payment_type == PaymentType.partial
+            else invoice.total_amount
+        )
+        await customer_service.apply_sale_to_balance(
+            db, invoice.customer_id, sale_amount=balance_amount,
+        )
+
+    # ── Transactions ─────────────────────────────────────────────────────────
+    await transaction_service.record_reference_transaction(
+        db, payment_method=None,
+        transaction_type=TransactionType.credit,
+        reference_type=ReferenceType.sale,
+        reference_id=invoice.id, amount=invoice.total_amount,
+        description=f"{invoice.invoice_no} — sale invoiced",
+        created_by=created_by,
+    )
+    if invoice.payment_type == PaymentType.cash:
+        await transaction_service.record_reference_transaction(
+            db, payment_method="cash",
+            transaction_type=TransactionType.credit,
+            reference_type=ReferenceType.sale_payment,
+            reference_id=invoice.id, amount=invoice.total_amount,
+            description=f"{invoice.invoice_no} — cash collected",
+            created_by=created_by,
+        )
+    elif invoice.payment_type == PaymentType.partial and invoice.paid_amount > 0:
+        await transaction_service.record_reference_transaction(
+            db, payment_method="cash",
+            transaction_type=TransactionType.credit,
+            reference_type=ReferenceType.sale_payment,
+            reference_id=invoice.id, amount=invoice.paid_amount,
+            description=f"{invoice.invoice_no} — partial payment upfront",
+            created_by=created_by,
+        )
+
     result = await _repo.get_with_items(db, invoice.id)
     await audit_service.log(
         db, user_id=created_by, action=AuditAction.CREATE,
@@ -261,7 +313,11 @@ async def update_sale(
     invoice = await _repo.get_with_items(db, invoice_id)
     if invoice is None:
         raise NotFoundException(f"Sale invoice {invoice_id} not found.")
-    _assert_status(invoice, SaleStatus.draft, action="update")
+    _assert_status(
+        invoice,
+        SaleStatus.confirmed, SaleStatus.paid, SaleStatus.partially_paid,
+        action="update",
+    )
 
     old = audit_service.snapshot(invoice)
 
@@ -279,7 +335,17 @@ async def update_sale(
             raise ValidationException("customer_id is required for regular customers.", field="customer_id")
 
     if new_items is not None:
+        from app.services import inventory_service
+
         item_repo = ItemRepository()
+
+        # Reverse stock for old line items
+        for old_line in invoice.items:
+            await inventory_service.record_return_in(
+                db, old_line.item_id, old_line.quantity,
+                reference_id=invoice.id, created_by=updated_by,
+            )
+
         await _item_repo.delete_for_invoice(db, invoice.id)
         invoice.items = []  # Clear relationship in memory to prevent SQLAlchemy error
 
@@ -316,6 +382,13 @@ async def update_sale(
             })
 
         await _item_repo.bulk_create(db, line_data)
+
+        # Apply stock out for new line items
+        for line in line_data:
+            await inventory_service.record_sale_out(
+                db, line["item_id"], line["quantity"],
+                reference_id=invoice.id, created_by=updated_by,
+            )
 
         header_discount = Decimal(str(patch.get("discount", invoice.discount)))
         tax = Decimal(str(patch.get("tax", invoice.tax)))
@@ -381,9 +454,34 @@ async def update_sale(
         patch.setdefault("walking_customer_address", None)
         patch.setdefault("walking_customer_tax_id", None)
 
+    # ── Reverse and reapply customer balance if financials changed ──────────
+    from app.services import customer_service
+
+    # Compute old balance contribution
+    old_cid = invoice.customer_id
+    old_pt = invoice.payment_type
+    old_bal = Decimal("0")
+    if old_cid and old_pt in (PaymentType.credit, PaymentType.partial):
+        old_bal = (invoice.total_amount - invoice.paid_amount) if old_pt == PaymentType.partial else invoice.total_amount
+
     updated = await _repo.update(db, invoice, patch)
     await db.flush()
-    await db.refresh(updated, ["due_amount", "updated_at"])
+    await db.refresh(updated, ["due_amount", "updated_at", "total_amount", "paid_amount", "payment_type", "customer_id"])
+
+    # Compute new balance contribution
+    new_cid = updated.customer_id
+    new_pt = updated.payment_type
+    new_bal = Decimal("0")
+    if new_cid and new_pt in (PaymentType.credit, PaymentType.partial):
+        new_bal = (updated.total_amount - updated.paid_amount) if new_pt == PaymentType.partial else updated.total_amount
+
+    # Reverse old, apply new (only if changed)
+    if old_bal != new_bal or old_cid != new_cid:
+        if old_cid and old_bal > 0:
+            await customer_service.apply_sale_to_balance(db, old_cid, sale_amount=-old_bal)
+        if new_cid and new_bal > 0:
+            await customer_service.apply_sale_to_balance(db, new_cid, sale_amount=new_bal)
+
     result = await _repo.get_with_items(db, invoice_id)
     await audit_service.log(
         db, user_id=updated_by, action=AuditAction.UPDATE,
@@ -521,11 +619,48 @@ async def confirm_sale(
 # ── Void (draft only) ─────────────────────────────────────────────────────────
 
 async def void_sale(db: AsyncSession, invoice_id: int, *, voided_by: int) -> SaleInvoice:
+    """
+    Void a sale invoice. Reverses stock and customer balance if confirmed.
+    """
+    from app.services import inventory_service, customer_service
+    from app.repositories.customer_repo import CustomerRepository
+
     invoice = await _repo.get_with_items(db, invoice_id)
     if invoice is None:
         raise NotFoundException(f"Sale invoice {invoice_id} not found.")
-    _assert_status(invoice, SaleStatus.draft, action="void")
+    _assert_status(
+        invoice,
+        SaleStatus.confirmed, SaleStatus.paid, SaleStatus.partially_paid,
+        action="void",
+    )
+
     old = audit_service.snapshot(invoice)
+
+    # Reverse stock: return items to inventory
+    for line in invoice.items:
+        await inventory_service.record_return_in(
+            db, line.item_id, line.quantity,
+            reference_id=invoice.id, created_by=voided_by,
+        )
+
+    # Reverse customer balance
+    if invoice.customer_id and invoice.payment_type in (PaymentType.credit, PaymentType.partial):
+        from app.services.customer_service import _compute_new_balance
+        customer_repo = CustomerRepository()
+        customer = await customer_repo.get_with_lock(db, invoice.customer_id)
+        if customer and customer.is_active:
+            balance_amount = (
+                invoice.total_amount - invoice.paid_amount
+                if invoice.payment_type == PaymentType.partial
+                else invoice.total_amount
+            )
+            new_balance, new_balance_type = _compute_new_balance(
+                customer.balance, customer.balance_type, delta=-balance_amount,
+            )
+            await customer_repo.apply_balance_update(
+                db, customer, new_balance=new_balance, new_balance_type=new_balance_type,
+            )
+
     await _repo.set_status(db, invoice, status=SaleStatus.void)
     await db.flush()
     voided = await _repo.get_with_items(db, invoice_id)
@@ -759,68 +894,24 @@ async def approve_return(
             created_by=approved_by,
         )
 
-    # Financial amounts: refund_amount is what the customer actually gets back
-    # (total_amount minus penalty). Penalty is retained as revenue.
-    refund = sale_return.refund_amount
-
-    # Reduce customer receivable by refund amount (not total — penalty is kept)
-    customer_repo = CustomerRepository()
-    invoice = await _repo.get_with_lock(db, invoice_id)
-    customer = await customer_repo.get_with_lock(db, invoice.customer_id) if invoice.customer_id else None
-    if customer and customer.is_active:
-        new_balance, new_balance_type = _compute_new_balance(
-            customer.balance,
-            customer.balance_type,
-            delta=-refund,
-        )
-        await customer_repo.apply_balance_update(
-            db, customer,
-            new_balance=new_balance,
-            new_balance_type=new_balance_type,
-        )
-
-    # Post reversal transaction for the refund amount
-    from app.services import transaction_service
-    from app.models.enums import TransactionType, ReferenceType
-    invoice_for_return = await _repo.get_with_items(db, invoice_id)
-    if refund > Decimal("0"):
-        await transaction_service.record_reference_transaction(
-            db,
-            payment_method=None,
-            transaction_type=TransactionType.debit,
-            reference_type=ReferenceType.sale_return,
-            reference_id=return_id,
-            amount=refund,
-            description=f"{invoice_for_return.invoice_no} — sale return refund",
-            created_by=approved_by,
-        )
-
-    # Post penalty as revenue if applicable
-    if sale_return.penalty > Decimal("0"):
-        await transaction_service.record_reference_transaction(
-            db,
-            payment_method=None,
-            transaction_type=TransactionType.credit,
-            reference_type=ReferenceType.sale_return,
-            reference_id=return_id,
-            amount=sale_return.penalty,
-            description=f"{invoice_for_return.invoice_no} — return penalty/restocking fee",
-            created_by=approved_by,
-        )
+    # Approval only moves stock. Financial balance changes happen when
+    # return payments are recorded (same as sale payment lifecycle).
 
     now = datetime.now(timezone.utc)
     await _ret_repo.approve(
         db, sale_return, approved_by=approved_by, approved_at=now
     )
 
-    # Update invoice paid_amount and status to reflect the return
-    new_paid = max(Decimal("0"), invoice_for_return.paid_amount - refund)
-    invoice_for_return.paid_amount = new_paid
-    if new_paid <= Decimal("0"):
-        invoice_for_return.status = SaleStatus.confirmed
-    elif new_paid < invoice_for_return.total_amount:
-        invoice_for_return.status = SaleStatus.partially_paid
-    db.add(invoice_for_return)
+    # Full return: mark sale as "returned"
+    invoice_for_return = await _repo.get_with_items(db, invoice_id)
+    total_approved_returns = sum(
+        r.total_amount
+        for r in await _ret_repo.list_for_invoice(db, invoice_id)
+        if r.status == ReturnStatus.approved
+    )
+    if total_approved_returns >= invoice_for_return.total_amount:
+        invoice_for_return.status = SaleStatus.returned
+        db.add(invoice_for_return)
 
     await db.flush()
     approved = await _ret_repo.get_with_items(db, return_id)
@@ -881,3 +972,89 @@ async def list_returns(
     if invoice is None:
         raise NotFoundException(f"Sale invoice {invoice_id} not found.")
     return await _ret_repo.list_for_invoice(db, invoice_id)
+
+
+async def list_approved_partial_returns(
+    db: AsyncSession, *, limit: int = 50
+) -> list[SaleReturn]:
+    """List approved partial returns globally (for display in sales list)."""
+    return await _ret_repo.list_approved_partial(db, limit=limit)
+
+
+async def record_return_payment(
+    db: AsyncSession,
+    invoice_id: int,
+    return_id: int,
+    body,
+    *,
+    created_by: int,
+) -> SaleReturn:
+    """
+    Record a refund payment to the customer for an approved return.
+    Updates received_amount and settlement_status. Adjusts customer balance.
+    """
+    from app.models.sale import SaleReturnPayment
+    from app.services import transaction_service
+    from app.services.customer_service import _compute_new_balance
+    from app.repositories.customer_repo import CustomerRepository
+    from app.models.enums import TransactionType, ReferenceType
+
+    sale_return = await _ret_repo.get_with_items(db, return_id)
+    if sale_return is None or sale_return.invoice_id != invoice_id:
+        raise NotFoundException(f"Return {return_id} not found.")
+    if sale_return.status != ReturnStatus.approved:
+        raise ValidationException("Can only record payments for approved returns.")
+
+    refund_due = sale_return.refund_amount - sale_return.received_amount
+    if body.amount > refund_due:
+        raise ValidationException(
+            f"Payment amount ({body.amount}) exceeds remaining refund due ({refund_due})."
+        )
+
+    # Record the payment row
+    payment = SaleReturnPayment(
+        return_id=return_id,
+        amount=body.amount,
+        payment_mode=body.payment_mode,
+        reference_no=body.reference_no,
+        note=body.note,
+        created_by=created_by,
+    )
+    db.add(payment)
+
+    # Update return settlement
+    new_received = sale_return.received_amount + body.amount
+    sale_return.received_amount = new_received
+    if new_received >= sale_return.refund_amount:
+        sale_return.settlement_status = "settled"
+    else:
+        sale_return.settlement_status = "partially_settled"
+    db.add(sale_return)
+
+    # Adjust customer balance
+    customer_repo = CustomerRepository()
+    invoice = await _repo.get_with_lock(db, invoice_id)
+    customer = await customer_repo.get_with_lock(db, invoice.customer_id) if invoice.customer_id else None
+    if customer and customer.is_active:
+        new_balance, new_balance_type = _compute_new_balance(
+            customer.balance, customer.balance_type, delta=-body.amount,
+        )
+        await customer_repo.apply_balance_update(
+            db, customer, new_balance=new_balance, new_balance_type=new_balance_type,
+        )
+
+    # Post financial transaction
+    invoice_for_ref = await _repo.get_with_items(db, invoice_id)
+    await transaction_service.record_reference_transaction(
+        db,
+        payment_method=body.payment_mode,
+        transaction_type=TransactionType.debit,
+        reference_type=ReferenceType.sale_return,
+        reference_id=return_id,
+        amount=body.amount,
+        description=f"{invoice_for_ref.invoice_no} — return refund payment ({body.payment_mode})",
+        created_by=created_by,
+    )
+
+    await db.flush()
+    return await _ret_repo.get_with_items(db, return_id)

@@ -12,10 +12,8 @@ Reports endpoints — all read-only, manager/admin access.
   GET /reports/payroll-summary          — monthly payroll disbursement
   GET /reports/production-summary       — production orders + costs for a date range
 
-Export routes:
-  POST /reports/{report_name}/export    — enqueue async export job
-  GET  /reports/exports/{job_id}        — poll job status
-  GET  /reports/exports/{job_id}/download — stream completed file
+Export:
+  POST /reports/{report_name}/export?fmt=csv|xlsx|pdf — generate and download
 
 RBAC:
   read → manager, admin  (staff excluded — reports are financial)
@@ -23,26 +21,24 @@ RBAC:
 
 from __future__ import annotations
 
-import os
 from datetime import date
 from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.arq_pool import get_arq_pool
 from app.core.database import get_db
 from app.core.dependencies import require_permission
 from app.models.auth import User
 from app.models.enums import BalanceType, MovementType
 from app.schemas.common import SuccessResponse
 from app.schemas.reports import (
+    ActivityLedgerReport,
     CashFlowReport,
     CustomerBalanceReport,
     ExportFormat,
-    ExportJobOut,
     PayrollSummaryReport,
     ProductionSummaryReport,
     ProfitLossReport,
@@ -61,11 +57,19 @@ ReadDep = Annotated[User, Depends(require_permission("reports", "read"))]
 
 
 def _mime(fmt: str) -> str:
-    return (
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        if fmt == "xlsx"
-        else "text/csv"
-    )
+    if fmt == "xlsx":
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if fmt == "pdf":
+        return "application/pdf"
+    return "text/csv"
+
+
+def _export_bytes(rows: list[dict], fmt: str, title: str = "Report") -> bytes:
+    if fmt == "xlsx":
+        return export_service.rows_to_xlsx_bytes(rows)
+    if fmt == "pdf":
+        return export_service.rows_to_pdf_bytes(rows, title=title)
+    return export_service.rows_to_csv_bytes(rows)
 
 
 # ── Profit & Loss ─────────────────────────────────────────────────────────────
@@ -81,11 +85,7 @@ async def profit_loss(
     report = await report_service.profit_loss(db, date_from, date_to)
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=profit-loss.{format}"},
@@ -106,11 +106,7 @@ async def sales_summary(
     report = await report_service.sales_summary(db, date_from, date_to)
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=sales-summary.{format}"},
@@ -131,11 +127,7 @@ async def purchase_summary(
     report = await report_service.purchase_summary(db, date_from, date_to)
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=purchase-summary.{format}"},
@@ -158,11 +150,7 @@ async def stock_summary(
     )
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=stock-summary.{format}"},
@@ -193,11 +181,7 @@ async def stock_movements(
     )
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=stock-movements.{format}"},
@@ -222,11 +206,7 @@ async def customer_balances(
     )
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=customer-balances.{format}"},
@@ -249,11 +229,7 @@ async def supplier_balances(
     )
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=supplier-balances.{format}"},
@@ -274,11 +250,7 @@ async def cash_flow(
     report = await report_service.cash_flow(db, date_from, date_to)
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=cash-flow.{format}"},
@@ -299,11 +271,7 @@ async def payroll_summary(
     report = await report_service.payroll_summary(db, payment_month, payment_year)
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=payroll-summary.{format}"},
@@ -324,11 +292,7 @@ async def production_summary(
     report = await report_service.production_summary(db, date_from, date_to)
     if format:
         rows = export_service.report_to_rows(report)
-        content = (
-            export_service.rows_to_xlsx_bytes(rows)
-            if format == "xlsx"
-            else export_service.rows_to_csv_bytes(rows)
-        )
+        content = _export_bytes(rows, format)
         return StreamingResponse(
             iter([content]), media_type=_mime(format),
             headers={"Content-Disposition": f"attachment; filename=production-summary.{format}"},
@@ -336,11 +300,12 @@ async def production_summary(
     return SuccessResponse(data=report)
 
 
-# ── Async Export routes ───────────────────────────────────────────────────────
+# ── Sync Export ───────────────────────────────────────────────────────────────
 
-@router.post("/{report_name}/export", summary="Enqueue an async export job")
-async def enqueue_export(
-    current_user: ReadDep,
+@router.post("/{report_name}/export", summary="Generate and download report export")
+async def export_report(
+    db: DbDep,
+    _: ReadDep,
     report_name: Annotated[str, Path()],
     fmt: Annotated[ExportFormat, Query()] = "csv",
     date_from: Annotated[date | None, Query()] = None,
@@ -350,56 +315,84 @@ async def enqueue_export(
     category_id: Annotated[int | None, Query()] = None,
     below_reorder_only: Annotated[bool, Query()] = False,
     item_id: Annotated[int | None, Query()] = None,
-) -> SuccessResponse[ExportJobOut]:
-    if export_service.get_report_fn(report_name) is None:
+    entity_type: Annotated[str | None, Query()] = None,
+    activity_type: Annotated[str | None, Query()] = None,
+) -> StreamingResponse:
+    report_fn = export_service.get_report_fn(report_name)
+    if report_fn is None:
         raise HTTPException(status_code=404, detail=f"Unknown report: {report_name}")
 
-    # Serialize date params to ISO strings (JSON-safe for ARQ)
-    params: dict = {}
+    kwargs: dict = {}
     if date_from is not None:
-        params["date_from"] = date_from.isoformat()
+        kwargs["date_from"] = date_from
     if date_to is not None:
-        params["date_to"] = date_to.isoformat()
+        kwargs["date_to"] = date_to
     if payment_month is not None:
-        params["payment_month"] = payment_month
+        kwargs["payment_month"] = payment_month
     if payment_year is not None:
-        params["payment_year"] = payment_year
+        kwargs["payment_year"] = payment_year
     if category_id is not None:
-        params["category_id"] = category_id
+        kwargs["category_id"] = category_id
     if below_reorder_only:
-        params["below_reorder_only"] = below_reorder_only
+        kwargs["below_reorder_only"] = below_reorder_only
     if item_id is not None:
-        params["item_id"] = item_id
+        kwargs["item_id"] = item_id
+    if entity_type is not None:
+        kwargs["entity_type"] = entity_type
+    if activity_type is not None:
+        kwargs["activity_type"] = activity_type
 
-    pool = await get_arq_pool()
-    job_out = await export_service.enqueue_export(
-        pool, report_name, params, fmt, current_user.id
+    report = await report_fn(db, **kwargs)
+    rows = export_service.report_to_rows(report)
+    title = report_name.replace("-", " ").title()
+    content = _export_bytes(rows, fmt, title=title)
+
+    return StreamingResponse(
+        iter([content]),
+        media_type=_mime(fmt),
+        headers={"Content-Disposition": f"attachment; filename={report_name}.{fmt}"},
     )
-    return SuccessResponse(data=job_out)
 
 
-@router.get("/exports/{job_id}", summary="Poll async export job status")
-async def export_status(
+# ── Activity Ledger ──────────────────────────────────────────────────────────
+
+@router.get("/activity-ledger", summary="Unified activity ledger across suppliers, customers, and staff")
+async def activity_ledger(
+    db: DbDep,
     _: ReadDep,
-    job_id: Annotated[str, Path()],
-) -> SuccessResponse[ExportJobOut]:
-    pool = await get_arq_pool()
-    status = await export_service.get_export_status(pool, job_id)
-    return SuccessResponse(data=status)
+    date_from: Annotated[date, Query()],
+    date_to: Annotated[date, Query()],
+    entity_type: Annotated[str | None, Query()] = None,
+    entity_id: Annotated[int | None, Query()] = None,
+    activity_type: Annotated[str | None, Query()] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+) -> SuccessResponse[ActivityLedgerReport]:
+    from app.core.exceptions import ValidationException
 
+    # Max 90 days range to prevent heavy queries
+    if (date_to - date_from).days > 90:
+        raise ValidationException("Date range cannot exceed 90 days.")
 
-@router.get("/exports/{job_id}/download", summary="Download a completed export file")
-async def export_download(
-    _: ReadDep,
-    job_id: Annotated[str, Path()],
-) -> FileResponse:
-    for fmt in ("csv", "xlsx"):
-        path = export_service.export_file_path(job_id, fmt)
-        if os.path.isfile(path):
-            media_type = _mime(fmt)
-            return FileResponse(
-                path,
-                media_type=media_type,
-                filename=f"export-{job_id}.{fmt}",
-            )
-    raise HTTPException(status_code=404, detail="Export file not found or not yet ready")
+    # Validate entity_type if provided
+    if entity_type and entity_type not in ("supplier", "customer", "staff"):
+        raise ValidationException(f"Invalid entity_type: {entity_type}. Must be supplier, customer, or staff.")
+
+    # Validate activity_type if provided
+    valid_activities = ("purchase", "sale", "payment", "return", "salary", "attendance", "production")
+    if activity_type and activity_type not in valid_activities:
+        raise ValidationException(f"Invalid activity_type: {activity_type}.")
+
+    # entity_id requires entity_type
+    if entity_id and not entity_type:
+        raise ValidationException("entity_type is required when entity_id is specified.")
+
+    report = await report_service.activity_ledger(
+        db, date_from, date_to,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        activity_type=activity_type,
+        page=page,
+        limit=limit,
+    )
+    return SuccessResponse(data=report)

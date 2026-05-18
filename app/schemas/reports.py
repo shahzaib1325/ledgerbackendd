@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 # ── Export types ──────────────────────────────────────────────────────────────
 
-ExportFormat = Literal["csv", "xlsx"]
+ExportFormat = Literal["csv", "xlsx", "pdf"]
 ExportJobStatus = Literal["queued", "in_progress", "complete", "failed"]
 
 
@@ -247,3 +247,44 @@ class ProductionSummaryReport(BaseModel):
     total_orders: int
     completed_orders: int
     total_production_cost: Decimal
+
+
+# ── Activity Ledger ──────────────────────────────────────────────────────────
+
+class ActivityRow(BaseModel):
+    date: str
+    activity_type: str      # purchase | sale | purchase_return | sale_return | payment_in | payment_out | salary | advance | attendance | production
+    reference: str           # PO-001, INV-001, etc.
+    description: str
+    amount: Decimal | None
+    reference_id: int | None
+
+
+class EntitySummary(BaseModel):
+    total_transactions: int
+    total_amount: Decimal
+    total_paid: Decimal
+    total_returns: Decimal
+
+
+class EntityBlock(BaseModel):
+    entity_type: str         # supplier | customer | staff
+    entity_id: int
+    entity_name: str
+    phone: str | None
+    meta: dict               # flexible metadata (balance, department, credit_limit, etc.)
+    summary: EntitySummary
+    activities: list[ActivityRow]
+
+
+class ActivityLedgerReport(BaseModel):
+    date_from: date
+    date_to: date
+    entity_type_filter: str | None
+    activity_type_filter: str | None
+    entities: list[EntityBlock]
+    total_entities: int
+    page: int
+    page_size: int
+    grand_total_amount: Decimal
+    grand_total_paid: Decimal

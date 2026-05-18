@@ -242,7 +242,10 @@ class PurchaseReturnRepository:
     ) -> PurchaseReturn | None:
         result = await db.execute(
             select(PurchaseReturn)
-            .options(selectinload(PurchaseReturn.return_items))
+            .options(
+                selectinload(PurchaseReturn.return_items),
+                selectinload(PurchaseReturn.payments),
+            )
             .where(PurchaseReturn.id == return_id)
             .execution_options(populate_existing=True)
         )
@@ -251,10 +254,37 @@ class PurchaseReturnRepository:
     async def list_for_purchase(
         self, db: AsyncSession, purchase_id: int
     ) -> list[PurchaseReturn]:
+        from sqlalchemy.orm import selectinload
         result = await db.execute(
             select(PurchaseReturn)
             .where(PurchaseReturn.purchase_id == purchase_id)
+            .options(
+                selectinload(PurchaseReturn.return_items),
+                selectinload(PurchaseReturn.payments),
+            )
             .order_by(desc(PurchaseReturn.created_at))
+        )
+        return list(result.scalars().all())
+
+    async def list_approved_partial(
+        self, db: AsyncSession, *, limit: int = 50
+    ) -> list[PurchaseReturn]:
+        """List approved partial returns (for display as separate rows in purchase list)."""
+        from sqlalchemy.orm import selectinload
+        from app.models.purchase import Purchase
+        result = await db.execute(
+            select(PurchaseReturn)
+            .join(Purchase, Purchase.id == PurchaseReturn.purchase_id)
+            .where(
+                PurchaseReturn.status == ReturnStatus.approved,
+                Purchase.status != PurchaseStatus.returned,  # exclude full returns
+            )
+            .options(
+                selectinload(PurchaseReturn.return_items),
+                selectinload(PurchaseReturn.payments),
+            )
+            .order_by(desc(PurchaseReturn.created_at))
+            .limit(limit)
         )
         return list(result.scalars().all())
 
