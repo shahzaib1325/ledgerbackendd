@@ -11,14 +11,21 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from app.models.enums import UserRole
-
 
 # ── Input schemas ─────────────────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1, max_length=128)
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str | None = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
 
 
 class RefreshRequest(BaseModel):
@@ -47,17 +54,38 @@ class RegisterRequest(BaseModel):
 
 # ── Output schemas ────────────────────────────────────────────────────────────
 
+class RoleBrief(BaseModel):
+    """Compact role representation embedded in user payloads."""
+
+    id: int
+    name: str
+    slug: str
+    is_system_role: bool
+
+    model_config = {"from_attributes": True}
+
+
 class UserOut(BaseModel):
     id: int
     username: str
     email: str
     full_name: str
-    role: UserRole
     is_active: bool
     last_login: datetime | None
     created_at: datetime
+    roles: list[RoleBrief] = []
 
     model_config = {"from_attributes": True}
+
+
+class MeOut(BaseModel):
+    """
+    Response for GET /auth/me — profile + assigned roles + the flattened,
+    de-duplicated list of effective permission keys used by the frontend.
+    """
+
+    user: UserOut
+    permissions: list[str]
 
 
 class TokenOut(BaseModel):

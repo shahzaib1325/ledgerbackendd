@@ -1,17 +1,19 @@
 """
-Shared FastAPI dependencies: authentication and RBAC.
+Shared FastAPI dependencies: authentication and dynamic RBAC.
 
-Design decisions (from SECURITY.md §2.3 and 01_AUTH.md §8):
-- RBAC uses a hardcoded PERMISSION_MATRIX resolved from user.role.
-  Zero DB lookups per request.  If runtime-configurable permissions
-  are needed in v2, the dict can be migrated to roles_permissions without
-  any API contract changes.
-- Redis blacklist check uses fail-open: if Redis is unreachable the
-  check is skipped and the request proceeds (token TTL bounds the risk).
-- JWT is decoded exactly ONCE per request inside _resolve_auth.
-  Both get_current_user and get_auth_context delegate to it; FastAPI's
-  per-request dependency cache ensures _resolve_auth runs only once even
-  when multiple dependants exist in the same route.
+Design decisions:
+- RBAC is fully dynamic: roles and their permission grants live in the
+  database and are managed at runtime by users with the `roles` permissions.
+- A user's effective permissions are resolved from the DB and cached in
+  Redis (see app/core/rbac.py). The cache is versioned, so any role or
+  permission change invalidates every cached entry at once.
+- The JWT identifies the user (`sub`) only; permissions are NEVER trusted
+  from the token — they are always resolved server-side per request.
+- The Super Admin system role short-circuits to allow-all, so newly added
+  permission keys are covered without re-granting.
+- require_permission keeps a backward-compatible signature: it accepts
+  either require_permission("module", "action") or the combined
+  require_permission("module:action").
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from app.core.exceptions import (
     TokenInvalidError,
     UnauthorizedException,
 )
+from app.core.rbac import SUPER_ADMIN_SLUG, get_user_permissions
 from app.core.redis import get_redis
 from app.core.security import decode_token
 from app.models.auth import User
@@ -42,51 +45,6 @@ from app.models.auth import User
 logger = structlog.get_logger(__name__)
 
 bearer_scheme = HTTPBearer(auto_error=False)
-
-# ── Static RBAC permission matrix ────────────────────────────────────────────
-# Source: 01_AUTH.md §8.  Keys: role → module → action → bool.
-# action is one of: "read", "write", "delete"
-
-PERMISSION_MATRIX: dict[str, dict[str, dict[str, bool]]] = {
-    "admin": {
-        "users":        {"read": True,  "write": True,  "delete": True},
-        "suppliers":    {"read": True,  "write": True,  "delete": True},
-        "customers":    {"read": True,  "write": True,  "delete": True},
-        "inventory":    {"read": True,  "write": True,  "delete": True},
-        "purchases":    {"read": True,  "write": True,  "delete": True},
-        "sales":        {"read": True,  "write": True,  "delete": True},
-        "staff":        {"read": True,  "write": True,  "delete": True},
-        "transactions": {"read": True,  "write": True,  "delete": True},
-        "production":   {"read": True,  "write": True,  "delete": True},
-        "reports":      {"read": True,  "write": False, "delete": False},
-        "audit":        {"read": True,  "write": False, "delete": False},
-    },
-    "manager": {
-        "users":        {"read": False, "write": False, "delete": False},
-        "suppliers":    {"read": True,  "write": True,  "delete": False},
-        "customers":    {"read": True,  "write": True,  "delete": False},
-        "inventory":    {"read": True,  "write": True,  "delete": False},
-        "purchases":    {"read": True,  "write": True,  "delete": False},
-        "sales":        {"read": True,  "write": True,  "delete": False},
-        "staff":        {"read": True,  "write": True,  "delete": False},
-        "transactions": {"read": True,  "write": True,  "delete": False},
-        "production":   {"read": True,  "write": True,  "delete": False},
-        "reports":      {"read": True,  "write": False, "delete": False},
-        "audit":        {"read": True,  "write": False, "delete": False},
-    },
-    "staff": {
-        "users":        {"read": False, "write": False, "delete": False},
-        "suppliers":    {"read": True,  "write": False, "delete": False},
-        "customers":    {"read": True,  "write": False, "delete": False},
-        "inventory":    {"read": True,  "write": False, "delete": False},
-        "purchases":    {"read": True,  "write": True,  "delete": False},
-        "sales":        {"read": True,  "write": True,  "delete": False},
-        "staff":        {"read": True,  "write": False, "delete": False},
-        "transactions": {"read": True,  "write": False, "delete": False},
-        "production":   {"read": True,  "write": True,  "delete": False},
-        "reports":      {"read": False, "write": False, "delete": False},
-    },
-}
 
 
 # ── AuthContext ───────────────────────────────────────────────────────────────
@@ -100,7 +58,7 @@ class AuthContext:
     Routes that also need payload fields (jti, exp) inject get_auth_context.
     """
     user: User
-    payload: dict  # decoded JWT claims: sub, jti, exp, role, username, type
+    payload: dict  # decoded JWT claims: sub, jti, exp, type, …
 
 
 # ── Private core resolver — decoded exactly once per request ──────────────────
@@ -113,7 +71,6 @@ async def _resolve_auth(
     """
     Validate the Bearer token and return AuthContext(user, payload).
 
-    Steps (SECURITY.md §1.5):
       1. Require Authorization: Bearer header
       2. Decode JWT — ExpiredSignatureError → 401 TOKEN_EXPIRED
                        JWTError            → 401 TOKEN_INVALID
@@ -145,6 +102,20 @@ async def _resolve_auth(
         is_blacklisted = await redis.exists(f"blacklist:jti:{jti}")
         if is_blacklisted:
             raise TokenInvalidError()
+
+        # Check if user sessions were globally revoked (e.g. password changed)
+        iat = payload.get("iat")
+        revoked_before_raw = await redis.get(f"user:revoked_before:{sub}")
+        if revoked_before_raw:
+            if isinstance(revoked_before_raw, bytes):
+                revoked_before = float(revoked_before_raw.decode())
+            else:
+                revoked_before = float(revoked_before_raw)
+            if iat is None or iat < int(revoked_before):
+                logger.info("access_token_revoked_by_password_change", user_id=sub)
+                raise TokenExpiredError()
+    except (TokenInvalidError, TokenExpiredError):
+        raise
     except (RedisConnectionError, RedisTimeoutError):
         logger.warning("redis_unavailable_blacklist_check_skipped", jti=jti)
         # Fail-open: 15-min TTL bounds the exploitable window.
@@ -170,50 +141,63 @@ def get_current_user(
 def get_auth_context(
     ctx: AuthContext = Depends(_resolve_auth),
 ) -> AuthContext:
-    """
-    Return the full AuthContext (user + token payload).
-
-    Use this instead of get_current_user when the route needs payload
-    fields such as jti or exp (e.g. logout).
-    """
+    """Return the full AuthContext (user + token payload)."""
     return ctx
+
+
+# ── Permission helpers ────────────────────────────────────────────────────────
+
+def is_super_admin(user: User) -> bool:
+    """True if any of the user's roles is the Super Admin system role."""
+    return any(
+        role.slug == SUPER_ADMIN_SLUG and role.is_active for role in user.roles
+    )
+
+
+async def get_effective_permissions(
+    user: User,
+    db: AsyncSession,
+    redis: Redis,
+) -> set[str]:
+    """Resolve the user's effective permission keys (Redis-cached)."""
+    return await get_user_permissions(db, redis, user.id)
 
 
 # ── require_permission ────────────────────────────────────────────────────────
 
-def require_permission(module: str, action: str):
+def require_permission(module: str, action: str | None = None):
     """
-    Dependency factory enforcing RBAC via the static PERMISSION_MATRIX.
+    Dependency factory enforcing dynamic RBAC.
 
-    action must be one of: "read", "write", "delete"
+    Accepts either form:
+        require_permission("suppliers", "delete")
+        require_permission("suppliers:delete")
 
-    Usage:
-        @router.delete("/{id}")
-        async def delete_supplier(
-            id: int,
-            current_user: User = Depends(require_permission("suppliers", "delete")),
-        ):
+    Super Admins are always allowed. Everyone else must hold the resolved
+    permission key in their effective (DB-backed, cached) permission set.
 
-    Returns the authenticated User so routes don't need a second Depends call.
+    Returns the authenticated User so routes don't need a second Depends.
     """
+    permission_key = module if action is None else f"{module}:{action}"
 
-    def _check(current_user: User = Depends(get_current_user)) -> User:
-        role_key = current_user.role.value
-        allowed = (
-            PERMISSION_MATRIX
-            .get(role_key, {})
-            .get(module, {})
-            .get(action, False)
-        )
-        if not allowed:
+    async def _check(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+        redis: Redis = Depends(get_redis),
+    ) -> User:
+        if is_super_admin(current_user):
+            return current_user
+
+        perms = await get_user_permissions(db, redis, current_user.id)
+        if permission_key not in perms:
             logger.info(
                 "permission_denied",
                 user_id=current_user.id,
-                role=role_key,
-                module=module,
-                action=action,
+                permission=permission_key,
             )
-            raise PermissionDeniedError()
+            raise PermissionDeniedError(
+                f"Missing required permission: {permission_key}"
+            )
         return current_user
 
     return _check

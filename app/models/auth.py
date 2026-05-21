@@ -3,17 +3,14 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
-    Enum,
     Index,
     Integer,
     String,
-    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
-from app.models.enums import UserRole
 
 
 class User(TimestampMixin, Base):
@@ -24,12 +21,6 @@ class User(TimestampMixin, Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(150), nullable=False)
-    role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole, name="user_role", native_enum=True),
-        nullable=False,
-        default=UserRole.staff,
-        server_default=UserRole.staff.value,
-    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
@@ -37,32 +28,20 @@ class User(TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # RBAC: a user holds zero or more roles. Effective permissions are the
+    # de-duplicated union of every assigned role's permissions.
+    roles: Mapped[list["Role"]] = relationship(  # noqa: F821
+        secondary="user_roles",
+        primaryjoin="User.id == UserRole.user_id",
+        secondaryjoin="Role.id == UserRole.role_id",
+        lazy="selectin",
+        order_by="Role.name",
+    )
+
     __table_args__ = (
         Index("idx_users_username", "username"),
         Index("idx_users_email", "email"),
     )
-
-
-class RolePermission(Base):
-    __tablename__ = "roles_permissions"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole, name="user_role", native_enum=True, create_type=False),
-        nullable=False,
-    )
-    module: Mapped[str] = mapped_column(String(50), nullable=False)
-    can_read: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-    can_write: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-    can_delete: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-
-    __table_args__ = (UniqueConstraint("role", "module", name="uq_roles_permissions_role_module"),)
 
 
 class TokenBlacklist(Base):

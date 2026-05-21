@@ -9,12 +9,6 @@ Alembic migrations when native_enum=True (the default).
 import enum
 
 
-class UserRole(str, enum.Enum):
-    admin = "admin"
-    manager = "manager"
-    staff = "staff"
-
-
 class PaymentMode(str, enum.Enum):
     cash = "cash"
     bank = "bank"

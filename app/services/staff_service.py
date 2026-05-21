@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +45,8 @@ from app.services import audit_service
 from app.repositories.staff_repo import (
     AdvanceRepository,
     AttendanceRepository,
+    PaymentLaborEntryRepository,
+    PerUnitEarningsRepository,
     SalaryStructureRepository,
     StaffPaymentRepository,
     StaffRepository,
@@ -53,10 +56,14 @@ from app.schemas.staff import (
     AttendanceBulkCreate,
     AttendanceCreate,
     AttendanceUpdate,
+    PerUnitEarningsSummary,
+    ProductionEarningEntry,
     SalaryStructureCreate,
     StaffCreate,
     StaffPaymentCreate,
     StaffUpdate,
+    UnpaidEarningsSummary,
+    UnpaidLaborEntry,
 )
 
 _repo = StaffRepository()
@@ -64,6 +71,8 @@ _salary_repo = SalaryStructureRepository()
 _att_repo = AttendanceRepository()
 _pay_repo = StaffPaymentRepository()
 _adv_repo = AdvanceRepository()
+_earn_repo = PerUnitEarningsRepository()
+_ple_repo = PaymentLaborEntryRepository()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -377,6 +386,103 @@ async def list_attendance(
     )
 
 
+# ── Per-Unit Earnings ────────────────────────────────────────────────────────
+
+async def get_per_unit_earnings(
+    db: AsyncSession,
+    staff_id: int,
+    month: int,
+    year: int,
+) -> PerUnitEarningsSummary:
+    staff = await _repo.get_or_404(db, staff_id)
+    _active_or_404(staff, staff_id)
+
+    if staff.compensation_type != CompensationType.per_unit:
+        raise ValidationException(
+            "Earnings summary is only available for per-unit staff.",
+            field="compensation_type",
+        )
+
+    labor_rows = await _earn_repo.list_earnings_for_month(db, staff_id, month, year)
+    total_earned = sum(
+        (row.total_cost for row in labor_rows), Decimal("0")
+    )
+    total_disbursed = await _pay_repo.sum_disbursed_for_month(
+        db, staff_id, month, year
+    )
+    due_amount = max(total_earned - total_disbursed, Decimal("0"))
+
+    entries = [
+        ProductionEarningEntry(
+            order_id=row.order.id,
+            order_no=row.order.order_no,
+            item_name=row.item.name if row.item else "Unknown",
+            quantity_produced=row.quantity_produced,
+            rate_per_unit=row.rate_per_unit,
+            labour_earning=row.total_cost,
+            completed_at=row.order.end_date,
+        )
+        for row in labor_rows
+    ]
+
+    return PerUnitEarningsSummary(
+        staff_id=staff_id,
+        month=month,
+        year=year,
+        total_earned=total_earned,
+        total_disbursed=total_disbursed,
+        due_amount=due_amount,
+        production_entries=entries,
+    )
+
+
+async def get_unpaid_earnings(
+    db: AsyncSession,
+    staff_id: int,
+) -> UnpaidEarningsSummary:
+    staff = await _repo.get_or_404(db, staff_id)
+    _active_or_404(staff, staff_id)
+
+    if staff.compensation_type != CompensationType.per_unit:
+        raise ValidationException(
+            "Unpaid earnings are only available for per-unit staff.",
+            field="compensation_type",
+        )
+
+    rows = await _earn_repo.list_unpaid_labor(db, staff_id)
+
+    carry_forward = Decimal("0")
+    new_earnings = Decimal("0")
+    entries: list[UnpaidLaborEntry] = []
+
+    for labor, remaining in rows:
+        is_partially_paid = remaining < labor.total_cost
+        if is_partially_paid:
+            carry_forward += remaining
+        else:
+            new_earnings += remaining
+
+        entries.append(UnpaidLaborEntry(
+            labor_id=labor.id,
+            order_id=labor.order.id,
+            order_no=labor.order.order_no,
+            item_name=labor.item.name if labor.item else "Unknown",
+            quantity_produced=labor.quantity_produced,
+            rate_per_unit=labor.rate_per_unit,
+            total_earning=labor.total_cost,
+            remaining_amount=remaining,
+            completed_at=labor.order.end_date,
+        ))
+
+    return UnpaidEarningsSummary(
+        staff_id=staff_id,
+        carry_forward_balance=carry_forward,
+        new_earnings=new_earnings,
+        total_due=carry_forward + new_earnings,
+        unpaid_entries=entries,
+    )
+
+
 # ── Salary Payment ────────────────────────────────────────────────────────────
 
 async def disburse_salary(
@@ -386,35 +492,64 @@ async def disburse_salary(
     created_by: int,
 ) -> StaffPayment:
     """
-    Record monthly salary disbursement for a staff member.
+    Record salary disbursement for a staff member.
 
-    - Validates no duplicate payment for the same month/year.
-    - Computes net_salary = gross + allowances − deductions − advance_deduction.
-    - Marks pending advances for this month as deducted.
-    - If account_id is supplied → posts a debit transaction via transaction_service.
+    salary_based:
+      - One payment per month (duplicate check enforced).
+      - net_salary = gross + allowances − deductions − advance_deduction.
+
+    per_unit:
+      - Multiple partial payments per month allowed.
+      - Validates payment_amount (gross_salary field) ≤ remaining due_amount
+        derived from production earnings minus prior disbursements.
     """
     staff = await _repo.get_or_404(db, body.staff_id)
     _active_or_404(staff, body.staff_id)
 
-    existing = await _pay_repo.get_for_month(
-        db, body.staff_id, body.payment_month, body.payment_year
-    )
-    if existing:
-        raise ConflictException(
-            f"Salary for {body.staff_id} for "
-            f"{body.payment_month}/{body.payment_year} already disbursed."
+    if staff.compensation_type == CompensationType.salary_based:
+        existing = await _pay_repo.get_for_month(
+            db, body.staff_id, body.payment_month, body.payment_year
         )
+        if existing:
+            raise ConflictException(
+                f"Salary for {body.staff_id} for "
+                f"{body.payment_month}/{body.payment_year} already disbursed."
+            )
+
+    unpaid_rows: list[tuple[Any, Decimal]] = []
+    if staff.compensation_type == CompensationType.per_unit:
+        unpaid_rows = await _earn_repo.list_unpaid_labor(db, body.staff_id)
+        total_due = sum(remaining for _, remaining in unpaid_rows)
+        if body.gross_salary > total_due:
+            raise ValidationException(
+                f"Payment amount ({body.gross_salary}) exceeds total due ({total_due}).",
+                field="gross_salary",
+            )
+
+    if staff.compensation_type == CompensationType.per_unit:
+        pending_advances = await _adv_repo.get_pending_up_to_month(
+            db, body.staff_id, body.payment_month, body.payment_year
+        )
+    else:
+        pending_advances = await _adv_repo.get_pending_for_month(
+            db, body.staff_id, body.payment_month, body.payment_year
+        )
+
+    advance_deduction = sum(
+        (a.amount for a in pending_advances), Decimal("0")
+    )
 
     net_salary = (
         body.gross_salary
         + body.total_allowances
         - body.total_deductions
-        - body.advance_deduction
+        - advance_deduction
     )
     if net_salary < Decimal("0"):
         raise ValidationException(
-            "Net salary cannot be negative. Check deduction amounts.",
-            field="advance_deduction",
+            f"Gross salary ({body.gross_salary}) is insufficient to cover "
+            f"pending advance deductions ({advance_deduction}).",
+            field="gross_salary",
         )
 
     payment = await _pay_repo.create(
@@ -426,7 +561,7 @@ async def disburse_salary(
             "gross_salary": body.gross_salary,
             "total_allowances": body.total_allowances,
             "total_deductions": body.total_deductions,
-            "advance_deduction": body.advance_deduction,
+            "advance_deduction": advance_deduction,
             "net_salary": net_salary,
             "payment_mode": body.payment_mode,
             "account_id": body.account_id,
@@ -436,16 +571,27 @@ async def disburse_salary(
         },
     )
 
-    # Mark advances for this month as deducted
-    pending_advances = await _adv_repo.get_pending_for_month(
-        db, body.staff_id, body.payment_month, body.payment_year
-    )
+    # FIFO allocation of payment across unpaid labor entries
+    if staff.compensation_type == CompensationType.per_unit and unpaid_rows:
+        budget = body.gross_salary
+        link_entries: list[dict] = []
+        for labor, remaining in unpaid_rows:
+            if budget <= 0:
+                break
+            alloc = min(budget, remaining)
+            link_entries.append({"labor_id": labor.id, "amount": alloc})
+            budget -= alloc
+        if link_entries:
+            await _ple_repo.create_entries(db, payment.id, link_entries)
+
     for advance in pending_advances:
         await _adv_repo.mark_deducted(db, advance)
 
     from app.services import transaction_service
+    desc_label = "Salary" if staff.compensation_type == CompensationType.salary_based else "Labour payment"
+    description = f"{desc_label} {staff.name} {body.payment_month}/{body.payment_year}"
+
     if body.account_id is not None:
-        # Bank / digital: post account-linked transaction (updates account balance)
         await transaction_service.record_account_transaction(
             db,
             account_id=body.account_id,
@@ -453,13 +599,11 @@ async def disburse_salary(
             reference_type=ReferenceType.salary,
             reference_id=payment.id,
             amount=net_salary,
-            description=f"Salary {staff.name} {body.payment_month}/{body.payment_year}",
+            description=description,
             transaction_date=date.today(),
             created_by=created_by,
         )
     else:
-        # Cash salary without a named account — post reference transaction so it
-        # appears in the financial ledger
         await transaction_service.record_reference_transaction(
             db,
             payment_method=body.payment_mode.value,
@@ -467,7 +611,7 @@ async def disburse_salary(
             reference_type=ReferenceType.salary,
             reference_id=payment.id,
             amount=net_salary,
-            description=f"Salary {staff.name} {body.payment_month}/{body.payment_year}",
+            description=description,
             created_by=created_by,
         )
     await db.flush()

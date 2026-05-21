@@ -296,7 +296,7 @@ async def update_purchase(
 
     old = audit_service.snapshot(purchase)
 
-    patch = body.model_dump(exclude_unset=True, exclude={"items"})
+    patch = body.model_dump(exclude_unset=True, exclude={"items", "paid_amount"})
     if patch:
         await _repo.update(db, purchase, patch)
 
@@ -352,6 +352,23 @@ async def update_purchase(
             discount=header_discount,
             total_amount=total_amount,
         )
+
+    # ── Reconcile paid_amount when payment_type changes ──────────────────────
+    await db.flush()
+    await db.refresh(purchase, ["total_amount", "paid_amount"])
+
+    eff_pt = body.payment_type if body.payment_type is not None else purchase.payment_type
+    if eff_pt == PaymentType.cash:
+        await _repo.update(db, purchase, {"paid_amount": purchase.total_amount})
+    elif eff_pt == PaymentType.credit:
+        await _repo.update(db, purchase, {"paid_amount": Decimal("0")})
+    elif eff_pt == PaymentType.partial:
+        paid = body.paid_amount if body.paid_amount is not None else purchase.paid_amount
+        if paid is None or paid <= Decimal("0") or paid > purchase.total_amount:
+            raise ValidationException(
+                "Partial payment amount must be greater than 0 and cannot exceed the total amount."
+            )
+        await _repo.update(db, purchase, {"paid_amount": paid})
 
     # ── Reverse and reapply supplier balance if financials changed ──────────
     from app.services import supplier_service

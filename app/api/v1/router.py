@@ -6,14 +6,19 @@ from app.api.v1.endpoints import (
     customers,
     dashboard,
     inventory,
+    permissions,
     production,
     purchases,
+    rbac_logs,
     reports,
+    roles,
     sales,
     search,
     staff,
     suppliers,
     transactions,
+    users,
+    whatsapp,
 )
 
 api_v1_router = APIRouter()
@@ -31,3 +36,14 @@ api_v1_router.include_router(reports.router, prefix="/reports", tags=["Reports"]
 api_v1_router.include_router(audit.router, prefix="/audit-logs", tags=["Audit"])
 api_v1_router.include_router(dashboard.router, prefix="", tags=["Dashboard"])
 api_v1_router.include_router(search.router, prefix="", tags=["Search"])
+api_v1_router.include_router(whatsapp.router, prefix="/whatsapp", tags=["WhatsApp"])
+
+# ── RBAC / Administration ─────────────────────────────────────────────────────
+api_v1_router.include_router(roles.router, prefix="/roles", tags=["RBAC - Roles"])
+api_v1_router.include_router(
+    permissions.router, prefix="/permissions", tags=["RBAC - Permissions"]
+)
+api_v1_router.include_router(users.router, prefix="/users", tags=["RBAC - Users"])
+api_v1_router.include_router(
+    rbac_logs.router, prefix="/rbac-logs", tags=["RBAC - Activity Logs"]
+)

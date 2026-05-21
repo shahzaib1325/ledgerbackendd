@@ -91,11 +91,14 @@ def create_access_token(
     *,
     subject: str | int,
     username: str,
-    role: str,
 ) -> tuple[str, str]:
     """
     Returns (encoded_jwt, jti).
     The JTI is returned so callers can store it in Redis on logout.
+
+    The token identifies the user only. Permissions are NEVER embedded —
+    they are resolved server-side per request (see app/core/rbac.py) so a
+    role change takes effect immediately without waiting for token expiry.
     """
     jti = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -103,7 +106,6 @@ def create_access_token(
     claims = {
         "sub": str(subject),
         "username": username,
-        "role": role,
         "jti": jti,
         "iat": now,
         "exp": expire,
@@ -115,15 +117,17 @@ def create_access_token(
 def create_refresh_token(*, subject: str | int) -> tuple[str, str]:
     """
     Returns (encoded_jwt, jti).
-    Refresh tokens carry only sub + jti (no role/username — always re-load from DB).
+    Refresh tokens carry sub, jti, iat, exp (no role/username — always re-load from DB).
     """
     jti = str(uuid.uuid4())
-    expire = datetime.now(timezone.utc) + timedelta(
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(
         days=settings.REFRESH_TOKEN_EXPIRE_DAYS
     )
     claims = {
         "sub": str(subject),
         "jti": jti,
+        "iat": now,
         "exp": expire,
         "type": "refresh",
     }
@@ -134,13 +138,12 @@ def create_token_pair(
     *,
     subject: str | int,
     username: str,
-    role: str,
 ) -> tuple[str, str, str, str]:
     """
     Convenience helper — returns (access_token, access_jti, refresh_token, refresh_jti).
     """
     access_token, access_jti = create_access_token(
-        subject=subject, username=username, role=role
+        subject=subject, username=username
     )
     refresh_token, refresh_jti = create_refresh_token(subject=subject)
     return access_token, access_jti, refresh_token, refresh_jti

@@ -8,7 +8,7 @@ import calendar
 from datetime import date, timedelta
 from typing import Literal
 
-from sqlalchemy import text, select, desc
+from sqlalchemy import text, select, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import report_service
@@ -239,17 +239,18 @@ async def get_dashboard(
     overdue_result = await db.execute(
         select(SaleInvoice)
         .where(
-            SaleInvoice.due_date < date.today(),
+            func.coalesce(SaleInvoice.due_date, SaleInvoice.invoice_date) <= date.today(),
             SaleInvoice.due_amount > 0,
+            SaleInvoice.status.notin_(["void", "returned"]),
         )
-        .order_by(SaleInvoice.due_date.asc())
+        .order_by(func.coalesce(SaleInvoice.due_date, SaleInvoice.invoice_date).asc())
         .limit(5)
     )
     overdue_sales = [
         OverdueSale(
             id=s.id,
             invoice_no=s.invoice_no or f"INV #{s.id}",
-            due_date=str(s.due_date),
+            due_date=str(s.due_date or s.invoice_date),
             due_amount=str(s.due_amount),
         )
         for s in overdue_result.scalars().all()

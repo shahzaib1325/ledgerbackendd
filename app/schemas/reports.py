@@ -182,20 +182,23 @@ class SupplierBalanceReport(BaseModel):
 
 # ── Cash Flow ─────────────────────────────────────────────────────────────────
 
-class AccountCashFlowRow(BaseModel):
-    account_id: int
+class CashFlowRow(BaseModel):
+    account_id: int | None = None
     account_name: str
-    account_type: AccountType
+    account_type: str
     opening_balance: Decimal
     total_credits: Decimal
     total_debits: Decimal
     closing_balance: Decimal
 
 
+AccountCashFlowRow = CashFlowRow
+
+
 class CashFlowReport(BaseModel):
     date_from: date
     date_to: date
-    accounts: list[AccountCashFlowRow]
+    accounts: list[CashFlowRow]
     net_cash_in: Decimal
     net_cash_out: Decimal
     net_position: Decimal
@@ -206,7 +209,7 @@ class CashFlowReport(BaseModel):
 class PayrollSummaryRow(BaseModel):
     staff_id: int
     staff_name: str
-    staff_type: StaffType
+    staff_type: StaffType | None = None
     payment_month: int
     payment_year: int
     gross_salary: Decimal

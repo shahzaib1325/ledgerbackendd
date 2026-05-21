@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 router = APIRouter(tags=["Dashboard"])
 
 DbDep = Annotated[AsyncSession, Depends(get_db)]
-ReadDep = Annotated[User, Depends(require_permission("transactions", "read"))]
+ReadDep = Annotated[User, Depends(require_permission("dashboard", "read"))]
 
 
 @router.get("/dashboard", summary="Consolidated dashboard data")

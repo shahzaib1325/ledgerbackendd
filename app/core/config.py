@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     EXPORT_STORAGE_PATH: str = "/tmp/smartledger_exports"
     EXPORT_MAX_ROWS_SYNC: int = 1000
 
+    # WhatsApp Business Cloud API
+    WHATSAPP_ACCESS_TOKEN: str = ""
+    WHATSAPP_PHONE_NUMBER_ID: str = ""
+
     model_config = SettingsConfigDict(
         env_file=_ENV_FILE if _ENV_FILE.exists() else None,
         case_sensitive=True,

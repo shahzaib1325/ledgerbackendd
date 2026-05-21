@@ -27,6 +27,7 @@ from app.models.enums import AttendanceStatus, CompensationType, PaymentMode, Sa
 
 if TYPE_CHECKING:
     from app.models.inventory import Item
+    from app.models.production import ProductionLabor
 
 
 class Staff(TimestampMixin, Base):
@@ -171,10 +172,6 @@ class StaffPayment(Base):
     account: Mapped["Account"] = relationship(foreign_keys=[account_id])  # type: ignore[name-defined]
 
     __table_args__ = (
-        UniqueConstraint(
-            "staff_id", "payment_month", "payment_year",
-            name="uq_staff_payments_staff_month_year",
-        ),
         CheckConstraint(
             "payment_month BETWEEN 1 AND 12",
             name="chk_staff_payments_month_range",
@@ -205,6 +202,29 @@ class Advance(Base):
 
     # ── Relationships ─────────────────────────────────────────────────────────
     staff: Mapped["Staff"] = relationship(back_populates="advances")
+
+
+class PaymentLaborEntry(Base):
+    """Links a staff payment to the production_labor rows it covers (audit trail)."""
+
+    __tablename__ = "payment_labor_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payment_id: Mapped[int] = mapped_column(
+        ForeignKey("staff_payments.id", ondelete="CASCADE"), nullable=False
+    )
+    labor_id: Mapped[int] = mapped_column(
+        ForeignKey("production_labor.id", ondelete="RESTRICT"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+
+    # ── Relationships ─────────────────────────────────────────────────────────
+    payment: Mapped["StaffPayment"] = relationship()
+    labor: Mapped["ProductionLabor"] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="chk_payment_labor_amount_positive"),
+    )
 
 
 class StaffItem(Base):

@@ -23,11 +23,19 @@ from app.models.enums import (  # noqa: F401
     SaleStatus,
     StaffType,
     TransactionType,
-    UserRole,
 )
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-from app.models.auth import RolePermission, TokenBlacklist, User  # noqa: F401
+from app.models.auth import TokenBlacklist, User  # noqa: F401
+
+# ── RBAC ──────────────────────────────────────────────────────────────────────
+from app.models.rbac import (  # noqa: F401
+    Permission,
+    RbacActivityLog,
+    Role,
+    RolePermission,
+    UserRole,
+)
 
 # ── Transactions (imported early — many other models FK into accounts) ────────
 from app.models.transaction import Account, Transaction, Transfer  # noqa: F401
@@ -87,12 +95,14 @@ __all__ = [
     "TimestampMixin",
     "AuditMixin",
     # Enums
-    "UserRole", "PaymentMode", "PaymentType", "BalanceType", "ItemType",
+    "PaymentMode", "PaymentType", "BalanceType", "ItemType",
     "MovementType", "PurchaseStatus", "SaleStatus", "ReturnStatus", "StaffType",
     "AttendanceStatus", "AccountType", "TransactionType", "ReferenceType",
     "ProductionStatus", "NotificationType", "AuditAction",
     # Auth
-    "User", "RolePermission", "TokenBlacklist",
+    "User", "TokenBlacklist",
+    # RBAC
+    "Role", "Permission", "RolePermission", "UserRole", "RbacActivityLog",
     # Transactions
     "Account", "Transaction", "Transfer",
     # Inventory

@@ -13,6 +13,7 @@ No FastAPI imports. No RBAC. No route logic.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import structlog
 from redis.asyncio import Redis
@@ -33,7 +34,6 @@ from app.core.security import (
     verify_password,
 )
 from app.models.auth import User
-from app.models.enums import UserRole
 
 logger = structlog.get_logger(__name__)
 
@@ -82,10 +82,9 @@ async def login_user(
     access_token, _access_jti, refresh_token, _refresh_jti = create_token_pair(
         subject=user.id,
         username=user.username,
-        role=user.role.value,
     )
 
-    logger.info("login_success", user_id=user.id, role=user.role.value)
+    logger.info("login_success", user_id=user.id)
 
     return TokenPair(access_token=access_token, refresh_token=refresh_token), user
 
@@ -97,30 +96,17 @@ async def register_user(
     email: str,
     password: str,
     full_name: str,
-    role: UserRole = UserRole.staff,
 ) -> User:
     """
     Create a new user account.
 
     - Username is stored and matched case-insensitively (lowercased on save).
     - Password is validated against policy then hashed.
-    - Default role is 'staff'; callers (admin endpoints) may pass a different role.
+    - A new user starts with NO roles; an admin assigns roles afterwards
+      via the user-management endpoints.
     - Raises ConflictException if username or email is already taken.
     """
     username_lower = username.lower()
-
-    # Only one admin may exist (enforced at DB level by partial unique index
-    # uq_one_admin; this check provides a clear application-level error first).
-    if role == UserRole.admin:
-        existing_admin = await db.execute(
-            select(User.id).where(User.role == UserRole.admin)
-        )
-        if existing_admin.scalar_one_or_none() is not None:
-            raise ConflictException(
-                "An admin user already exists. Only one admin is allowed.",
-                code="CONFLICT",
-                field="role",
-            )
 
     # Uniqueness checks — separate queries so we can give a specific field error.
     existing_username = await db.execute(
@@ -151,14 +137,13 @@ async def register_user(
         email=email.lower(),
         hashed_password=hash_password(password),
         full_name=full_name,
-        role=role,
         is_active=True,
     )
     db.add(user)
     await db.flush()   # assigns user.id without committing — caller owns the transaction
     await db.refresh(user)
 
-    logger.info("user_registered", user_id=user.id, role=user.role.value)
+    logger.info("user_registered", user_id=user.id)
     return user
 
 
@@ -177,7 +162,6 @@ async def refresh_tokens(
     - Blacklists the consumed refresh token (rotation — one-time use).
     - Returns a fresh TokenPair.
     """
-    from datetime import datetime, timezone
     from jose import ExpiredSignatureError, JWTError
 
     try:
@@ -201,6 +185,20 @@ async def refresh_tokens(
         is_blacklisted = await redis.exists(f"blacklist:jti:{jti}")
         if is_blacklisted:
             raise TokenInvalidError()
+
+        # Check if user sessions were globally revoked (e.g. password changed)
+        iat = payload.get("iat")
+        revoked_before_raw = await redis.get(f"user:revoked_before:{sub}")
+        if revoked_before_raw:
+            if isinstance(revoked_before_raw, bytes):
+                revoked_before = float(revoked_before_raw.decode())
+            else:
+                revoked_before = float(revoked_before_raw)
+            if iat is None or iat < int(revoked_before):
+                logger.info("refresh_token_revoked_by_password_change", user_id=sub)
+                raise TokenInvalidError()
+    except TokenInvalidError:
+        raise
     except Exception:
         pass  # fail-open — same policy as _resolve_auth
 
@@ -217,7 +215,6 @@ async def refresh_tokens(
     access_token, _access_jti, new_refresh_token, _refresh_jti = create_token_pair(
         subject=user.id,
         username=user.username,
-        role=user.role.value,
     )
 
     logger.info("tokens_refreshed", user_id=user.id)
@@ -242,3 +239,44 @@ async def logout_user(
     """
     await redis.set(f"blacklist:jti:{jti}", "1", ex=ttl_seconds)
     logger.info("token_blacklisted", jti=jti, ttl_seconds=ttl_seconds)
+
+
+async def change_password_user(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    user: User,
+    current_password: str,
+    new_password: str,
+) -> None:
+    """
+    Change the authenticated user's password.
+
+    Checks:
+    - current_password must match user's hashed_password.
+    - new_password must be different from current_password.
+    - new_password must comply with password policy rules.
+    """
+    if not verify_password(current_password, user.hashed_password):
+        raise ValueError("Incorrect current password.")
+
+    if current_password == new_password:
+        raise ValueError("New password cannot be the same as the current password.")
+
+    # Enforce password policy (raises ValueError)
+    validate_password_policy(new_password, username=user.username)
+
+    user.hashed_password = hash_password(new_password)
+    db.add(user)
+
+    # Invalidate all active sessions globally by setting a revocation timestamp
+    try:
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        # TTL of 7 days (604800 seconds) matches refresh token expiration
+        await redis.set(f"user:revoked_before:{user.id}", str(now_ts), ex=604800)
+        logger.info("global_sessions_revoked", user_id=user.id, timestamp=now_ts)
+    except Exception as exc:
+        # Fail-open / log warning if Redis is down — password change still succeeds
+        logger.warning("failed_to_revoke_sessions_redis", user_id=user.id, error=str(exc))
+
+    logger.info("password_changed_successfully", user_id=user.id)

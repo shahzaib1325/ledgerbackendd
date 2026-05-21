@@ -353,19 +353,20 @@ async def complete_order(
             total_cost=mat.required_quantity * mat.unit_cost,
         )
 
-    # Post expense transaction for labor + overhead costs paid in cash
+    # Post expense transaction for overhead costs only.
+    # Labor costs are accrued here but cash only leaves when staff salary
+    # is disbursed — recording labor as a cash outflow now would double-count.
     from app.services import transaction_service
     from app.models.enums import TransactionType, ReferenceType as RefType
-    total_expenses = order.total_labor_cost + order.total_other_cost
-    if total_expenses > Decimal("0"):
+    if order.total_other_cost > Decimal("0"):
         await transaction_service.record_reference_transaction(
             db,
             payment_method="cash",
             transaction_type=TransactionType.debit,
             reference_type=RefType.expense,
             reference_id=order_id,
-            amount=total_expenses,
-            description=f"{order.order_no} — labor & overhead expenses",
+            amount=order.total_other_cost,
+            description=f"{order.order_no} — overhead expenses",
             created_by=completed_by,
         )
 
@@ -394,6 +395,7 @@ async def complete_order(
         new_values=audit_service.snapshot(output),
     )
 
+    order.end_date = date.today()
     await _repo.set_status(db, order, status=ProductionStatus.completed)
     await db.flush()
     await db.refresh(order, ["total_cost", "updated_at"])

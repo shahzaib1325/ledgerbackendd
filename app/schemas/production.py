@@ -48,7 +48,7 @@ class RawMaterialOut(BaseModel):
 
 class LaborCreate(BaseModel):
     staff_id: int | None = None
-    category_id: int | None = None
+    item_id: int | None = None
     quantity_produced: Decimal = Field(..., ge=0, decimal_places=3)
     rate_per_unit: Decimal = Field(..., ge=0, decimal_places=2)
 
@@ -57,7 +57,7 @@ class LaborOut(BaseModel):
     id: int
     order_id: int
     staff_id: int | None
-    category_id: int | None
+    item_id: int | None
     quantity_produced: Decimal
     rate_per_unit: Decimal
     total_cost: Decimal

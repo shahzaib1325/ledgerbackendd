@@ -250,6 +250,56 @@ class AdvanceOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Per-Unit Earnings ────────────────────────────────────────────────────────
+
+class ProductionEarningEntry(BaseModel):
+    """One labour entry from a completed production order."""
+    order_id: int
+    order_no: str
+    item_name: str
+    quantity_produced: Decimal
+    rate_per_unit: Decimal
+    labour_earning: Decimal
+    completed_at: date | None
+
+    model_config = {"from_attributes": True}
+
+
+class PerUnitEarningsSummary(BaseModel):
+    """Payroll-period earnings summary for a per-unit staff member."""
+    staff_id: int
+    month: int
+    year: int
+    total_earned: Decimal
+    total_disbursed: Decimal
+    due_amount: Decimal
+    production_entries: list[ProductionEarningEntry]
+
+
+class UnpaidLaborEntry(BaseModel):
+    """A production labor row with remaining unpaid amount."""
+    labor_id: int
+    order_id: int
+    order_no: str
+    item_name: str
+    quantity_produced: Decimal
+    rate_per_unit: Decimal
+    total_earning: Decimal
+    remaining_amount: Decimal
+    completed_at: date | None
+
+    model_config = {"from_attributes": True}
+
+
+class UnpaidEarningsSummary(BaseModel):
+    """Full unpaid earnings ledger for a per-unit staff member."""
+    staff_id: int
+    carry_forward_balance: Decimal
+    new_earnings: Decimal
+    total_due: Decimal
+    unpaid_entries: list[UnpaidLaborEntry]
+
+
 # ── Query params ──────────────────────────────────────────────────────────────
 
 StaffSortField = Literal["name", "join_date", "created_at"]

@@ -52,6 +52,7 @@ from app.schemas.staff import (
     AttendanceCreate,
     AttendanceOut,
     AttendanceUpdate,
+    PerUnitEarningsSummary,
     SalaryStructureCreate,
     SalaryStructureOut,
     SortOrder,
@@ -62,6 +63,7 @@ from app.schemas.staff import (
     StaffPaymentOut,
     StaffSortField,
     StaffUpdate,
+    UnpaidEarningsSummary,
 )
 from app.services import staff_service
 
@@ -268,6 +270,38 @@ async def update_attendance(
     await db.commit()
     await db.refresh(attendance)
     return SuccessResponse(data=AttendanceOut.model_validate(attendance))
+
+
+# ── Per-Unit Earnings ────────────────────────────────────────────────────────
+
+@router.get(
+    "/{staff_id}/earnings",
+    summary="Get per-unit staff earnings summary for a payroll period",
+)
+async def get_per_unit_earnings(
+    staff_id: int,
+    db: DbDep,
+    _: ReadDep,
+    month: Annotated[int, Query(ge=1, le=12)] = 1,
+    year: Annotated[int, Query(ge=2000, le=2100)] = 2026,
+) -> SuccessResponse[PerUnitEarningsSummary]:
+    summary = await staff_service.get_per_unit_earnings(
+        db, staff_id, month, year
+    )
+    return SuccessResponse(data=summary)
+
+
+@router.get(
+    "/{staff_id}/unpaid-earnings",
+    summary="Get all unpaid production earnings for a per-unit staff member",
+)
+async def get_unpaid_earnings(
+    staff_id: int,
+    db: DbDep,
+    _: ReadDep,
+) -> SuccessResponse[UnpaidEarningsSummary]:
+    summary = await staff_service.get_unpaid_earnings(db, staff_id)
+    return SuccessResponse(data=summary)
 
 
 # ── Payroll ───────────────────────────────────────────────────────────────────

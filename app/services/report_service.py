@@ -15,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.reports import (
-    AccountCashFlowRow,
+    CashFlowRow,
     ActivityLedgerReport,
     ActivityRow,
     CashFlowReport,
@@ -80,11 +80,14 @@ async def profit_loss(
 
     gross_profit = total_revenue - total_purchase_cost
 
-    # Salary expense in range (paid_at)
+    # Salary expense in range — exclude per-unit staff whose labor cost
+    # is already captured under production_labor (avoids double-counting)
     sal = await db.execute(text("""
-        SELECT COALESCE(SUM(net_salary), 0) AS expense
-        FROM staff_payments
-        WHERE paid_at::date BETWEEN :from AND :to
+        SELECT COALESCE(SUM(sp.net_salary), 0) AS expense
+        FROM staff_payments sp
+        JOIN staff s ON s.id = sp.staff_id
+        WHERE sp.paid_at::date BETWEEN :from AND :to
+          AND s.compensation_type != 'per_unit'
     """), {"from": date_from, "to": date_to})
     total_salary_expense = Decimal(str(sal.scalar_one()))
 
@@ -266,7 +269,10 @@ async def stock_summary(
         filters.append("i.category_id = :cat_id")
         params["cat_id"] = category_id
     if below_reorder_only:
-        filters.append("i.reorder_level > 0 AND i.current_stock <= i.reorder_level")
+        filters.append(
+            "(i.current_stock <= 0"
+            " OR (i.reorder_level > 0 AND i.current_stock <= i.reorder_level))"
+        )
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
 
@@ -279,7 +285,9 @@ async def stock_summary(
             c.name          AS category_name,
             i.current_stock,
             i.reorder_level,
-            (i.current_stock <= i.reorder_level) AS is_below_reorder
+            (i.current_stock <= 0
+             OR (i.reorder_level > 0 AND i.current_stock <= i.reorder_level)
+            ) AS is_below_reorder
         FROM items i
         LEFT JOIN categories c ON c.id = i.category_id
         {where}
@@ -493,7 +501,8 @@ async def cash_flow(
     date_from: date,
     date_to: date,
 ) -> CashFlowReport:
-    rows = await db.execute(text("""
+    # 1. Account-linked transactions (real accounts with running balances)
+    acct_rows = await db.execute(text("""
         SELECT
             a.id                                                        AS account_id,
             a.name                                                      AS account_name,
@@ -513,16 +522,34 @@ async def cash_flow(
         ORDER BY a.name
     """), {"from": date_from, "to": date_to})
 
-    accounts = []
+    # 2. Reference-only transactions (no account, grouped by payment_method)
+    #    Exclude NULL payment_method — those are accrual postings (credit
+    #    invoices / credit purchases) that represent no actual cash movement.
+    ref_rows = await db.execute(text("""
+        SELECT
+            t.payment_method                                            AS method,
+            COALESCE(SUM(CASE WHEN t.transaction_type = 'credit'
+                         THEN t.amount ELSE 0 END), 0)                 AS total_credits,
+            COALESCE(SUM(CASE WHEN t.transaction_type = 'debit'
+                         THEN t.amount ELSE 0 END), 0)                 AS total_debits
+        FROM transactions t
+        WHERE t.account_id IS NULL
+          AND t.payment_method IS NOT NULL
+          AND t.transaction_date BETWEEN :from AND :to
+        GROUP BY t.payment_method
+        ORDER BY method
+    """), {"from": date_from, "to": date_to})
+
+    rows: list[CashFlowRow] = []
     net_cash_in = Decimal("0")
     net_cash_out = Decimal("0")
 
-    for r in rows.mappings().all():
+    for r in acct_rows.mappings().all():
         credits = Decimal(str(r["total_credits"]))
         debits = Decimal(str(r["total_debits"]))
         net_cash_in += credits
         net_cash_out += debits
-        accounts.append(AccountCashFlowRow(
+        rows.append(CashFlowRow(
             account_id=r["account_id"],
             account_name=r["account_name"],
             account_type=r["account_type"],
@@ -532,10 +559,27 @@ async def cash_flow(
             closing_balance=Decimal(str(r["current_balance"])),
         ))
 
+    METHOD_LABELS = {"cash": "Cash", "bank": "Bank (Direct)", "digital": "Digital (Direct)"}
+    for r in ref_rows.mappings().all():
+        method = str(r["method"])
+        credits = Decimal(str(r["total_credits"]))
+        debits = Decimal(str(r["total_debits"]))
+        net_cash_in += credits
+        net_cash_out += debits
+        rows.append(CashFlowRow(
+            account_id=None,
+            account_name=METHOD_LABELS.get(method, method.title()),
+            account_type=method,
+            opening_balance=Decimal("0"),
+            total_credits=credits,
+            total_debits=debits,
+            closing_balance=credits - debits,
+        ))
+
     return CashFlowReport(
         date_from=date_from,
         date_to=date_to,
-        accounts=accounts,
+        accounts=rows,
         net_cash_in=net_cash_in,
         net_cash_out=net_cash_out,
         net_position=net_cash_in - net_cash_out,

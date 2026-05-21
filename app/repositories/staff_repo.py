@@ -15,11 +15,12 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Literal
 
-from sqlalchemy import UniqueConstraint, and_, asc, desc, func, select
+from sqlalchemy import and_, asc, desc, extract, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import AttendanceStatus, CompensationType
-from app.models.staff import Advance, Attendance, SalaryStructure, Staff, StaffItem, StaffPayment
+from app.models.enums import AttendanceStatus, CompensationType, ProductionStatus
+from app.models.production import ProductionLabor, ProductionOrder
+from app.models.staff import Advance, Attendance, PaymentLaborEntry, SalaryStructure, Staff, StaffItem, StaffPayment
 from app.repositories.base_repo import BaseRepository
 
 
@@ -222,6 +223,20 @@ class StaffPaymentRepository:
         )
         return result.scalar_one_or_none()
 
+    async def sum_disbursed_for_month(
+        self, db: AsyncSession, staff_id: int, month: int, year: int
+    ) -> Decimal:
+        result = await db.execute(
+            select(func.coalesce(func.sum(StaffPayment.net_salary), 0)).where(
+                and_(
+                    StaffPayment.staff_id == staff_id,
+                    StaffPayment.payment_month == month,
+                    StaffPayment.payment_year == year,
+                )
+            )
+        )
+        return Decimal(str(result.scalar_one()))
+
     async def create(
         self, db: AsyncSession, data: dict[str, Any]
     ) -> StaffPayment:
@@ -304,7 +319,176 @@ class AdvanceRepository:
         )
         return list(result.scalars().all())
 
+    async def get_pending_up_to_month(
+        self, db: AsyncSession, staff_id: int, month: int, year: int
+    ) -> list[Advance]:
+        """Return all undeducted advances scheduled on or before the given month/year."""
+        result = await db.execute(
+            select(Advance).where(
+                and_(
+                    Advance.staff_id == staff_id,
+                    Advance.is_deducted == False,  # noqa: E712
+                    or_(
+                        Advance.deduct_from_year < year,
+                        and_(
+                            Advance.deduct_from_year == year,
+                            Advance.deduct_from_month <= month,
+                        ),
+                    ),
+                )
+            )
+        )
+        return list(result.scalars().all())
+
     async def mark_deducted(self, db: AsyncSession, advance: Advance) -> None:
         advance.is_deducted = True
         db.add(advance)
         await db.flush()
+
+
+class PerUnitEarningsRepository:
+    """Queries production_labor to compute per-unit staff earnings."""
+
+    async def list_earnings_for_month(
+        self,
+        db: AsyncSession,
+        staff_id: int,
+        month: int,
+        year: int,
+    ) -> list[ProductionLabor]:
+        """Return completed labor rows for a given payroll month (by order end_date)."""
+        from sqlalchemy.orm import selectinload
+
+        stmt = (
+            select(ProductionLabor)
+            .join(ProductionOrder, ProductionLabor.order_id == ProductionOrder.id)
+            .where(
+                and_(
+                    ProductionLabor.staff_id == staff_id,
+                    ProductionOrder.status == ProductionStatus.completed,
+                    extract("month", ProductionOrder.end_date) == month,
+                    extract("year", ProductionOrder.end_date) == year,
+                )
+            )
+            .options(
+                selectinload(ProductionLabor.order),
+                selectinload(ProductionLabor.item),
+            )
+            .order_by(ProductionOrder.end_date)
+        )
+        result = await db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def list_unpaid_labor(
+        self,
+        db: AsyncSession,
+        staff_id: int,
+    ) -> list[tuple[ProductionLabor, Decimal]]:
+        """Return (labor_row, remaining_amount) for all completed labor with unpaid balance."""
+        from sqlalchemy.orm import selectinload
+
+        paid_subq = (
+            select(
+                PaymentLaborEntry.labor_id,
+                func.coalesce(func.sum(PaymentLaborEntry.amount), 0).label("paid"),
+            )
+            .group_by(PaymentLaborEntry.labor_id)
+            .subquery()
+        )
+
+        stmt = (
+            select(
+                ProductionLabor,
+                (ProductionLabor.total_cost - func.coalesce(paid_subq.c.paid, 0)).label("remaining"),
+            )
+            .join(ProductionOrder, ProductionLabor.order_id == ProductionOrder.id)
+            .outerjoin(paid_subq, paid_subq.c.labor_id == ProductionLabor.id)
+            .where(
+                and_(
+                    ProductionLabor.staff_id == staff_id,
+                    ProductionOrder.status == ProductionStatus.completed,
+                    (ProductionLabor.total_cost - func.coalesce(paid_subq.c.paid, 0)) > 0,
+                )
+            )
+            .options(
+                selectinload(ProductionLabor.order),
+                selectinload(ProductionLabor.item),
+            )
+            .order_by(ProductionOrder.end_date)
+        )
+        result = await db.execute(stmt)
+        return [(row[0], Decimal(str(row[1]))) for row in result.all()]
+
+    async def sum_total_unpaid(
+        self,
+        db: AsyncSession,
+        staff_id: int,
+    ) -> Decimal:
+        """Total unpaid earnings across all completed production work."""
+        paid_subq = (
+            select(
+                PaymentLaborEntry.labor_id,
+                func.coalesce(func.sum(PaymentLaborEntry.amount), 0).label("paid"),
+            )
+            .group_by(PaymentLaborEntry.labor_id)
+            .subquery()
+        )
+
+        result = await db.execute(
+            select(
+                func.coalesce(
+                    func.sum(ProductionLabor.total_cost - func.coalesce(paid_subq.c.paid, 0)),
+                    0,
+                )
+            )
+            .join(ProductionOrder, ProductionLabor.order_id == ProductionOrder.id)
+            .outerjoin(paid_subq, paid_subq.c.labor_id == ProductionLabor.id)
+            .where(
+                and_(
+                    ProductionLabor.staff_id == staff_id,
+                    ProductionOrder.status == ProductionStatus.completed,
+                    (ProductionLabor.total_cost - func.coalesce(paid_subq.c.paid, 0)) > 0,
+                )
+            )
+        )
+        return Decimal(str(result.scalar_one()))
+
+    async def sum_earned_for_month(
+        self,
+        db: AsyncSession,
+        staff_id: int,
+        month: int,
+        year: int,
+    ) -> Decimal:
+        result = await db.execute(
+            select(
+                func.coalesce(func.sum(ProductionLabor.total_cost), 0)
+            )
+            .join(ProductionOrder, ProductionLabor.order_id == ProductionOrder.id)
+            .where(
+                and_(
+                    ProductionLabor.staff_id == staff_id,
+                    ProductionOrder.status == ProductionStatus.completed,
+                    extract("month", ProductionOrder.end_date) == month,
+                    extract("year", ProductionOrder.end_date) == year,
+                )
+            )
+        )
+        return Decimal(str(result.scalar_one()))
+
+
+class PaymentLaborEntryRepository:
+
+    async def create_entries(
+        self,
+        db: AsyncSession,
+        payment_id: int,
+        entries: list[dict[str, Any]],
+    ) -> list[PaymentLaborEntry]:
+        objects = []
+        for entry in entries:
+            obj = PaymentLaborEntry(payment_id=payment_id, **entry)
+            db.add(obj)
+            objects.append(obj)
+        await db.flush()
+        return objects

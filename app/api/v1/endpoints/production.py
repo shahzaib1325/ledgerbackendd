@@ -79,7 +79,7 @@ def _serialize_order(order) -> ProductionOrderOut:
         ],
         "labor": [
             {"id": lb.id, "order_id": lb.order_id, "staff_id": lb.staff_id,
-             "category_id": lb.item_id, "quantity_produced": lb.quantity_produced,
+             "item_id": lb.item_id, "quantity_produced": lb.quantity_produced,
              "rate_per_unit": lb.rate_per_unit, "total_cost": lb.total_cost}
             for lb in order.labor
         ],

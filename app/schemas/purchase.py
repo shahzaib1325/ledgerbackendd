@@ -90,11 +90,12 @@ class PurchaseCreate(BaseModel):
 
 
 class PurchaseUpdate(BaseModel):
-    """Only editable while status=draft."""
+    """Only editable while status=confirmed."""
 
     invoice_no: str | None = None
     purchase_date: date | None = None
     payment_type: PaymentType | None = None
+    paid_amount: Decimal | None = Field(None, ge=0, decimal_places=2)
     discount: Decimal | None = Field(None, ge=0, decimal_places=2)
     items: list[PurchaseItemCreate] | None = None
     notes: str | None = None
