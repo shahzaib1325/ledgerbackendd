@@ -123,14 +123,17 @@ async def create_staff(
         db.add(structure)
         await db.flush()
 
-    # Create item assignments
+    # Create item assignments (deduplicate by item_id, last value wins)
+    seen_item_ids: set[int] = set()
     for item in body.items:
-        db.add(StaffItem(
-            staff_id=staff.id,
-            item_id=item.item_id,
-            rate_per_unit=item.rate_per_unit,
-        ))
-    if body.items:
+        if item.item_id not in seen_item_ids:
+            seen_item_ids.add(item.item_id)
+            db.add(StaffItem(
+                staff_id=staff.id,
+                item_id=item.item_id,
+                rate_per_unit=item.rate_per_unit,
+            ))
+    if seen_item_ids:
         await db.flush()
 
     await audit_service.log(
@@ -202,13 +205,17 @@ async def update_staff(
         for item in staff.items:
             await db.delete(item)
         await db.flush()
+        seen_item_ids: set[int] = set()
         for item in body.items:
-            db.add(StaffItem(
-                staff_id=staff_id,
-                item_id=item.item_id,
-                rate_per_unit=item.rate_per_unit,
-            ))
-        await db.flush()
+            if item.item_id not in seen_item_ids:
+                seen_item_ids.add(item.item_id)
+                db.add(StaffItem(
+                    staff_id=staff_id,
+                    item_id=item.item_id,
+                    rate_per_unit=item.rate_per_unit,
+                ))
+        if seen_item_ids:
+            await db.flush()
 
     await audit_service.log(
         db, user_id=updated_by, action=AuditAction.UPDATE,

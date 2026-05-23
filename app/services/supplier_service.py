@@ -141,9 +141,12 @@ async def create_supplier(
         },
     )
 
+    seen_item_ids: set[int] = set()
     for item in body.items:
-        db.add(SupplierItem(supplier_id=supplier.id, item_id=item.item_id))
-    if body.items:
+        if item.item_id not in seen_item_ids:
+            seen_item_ids.add(item.item_id)
+            db.add(SupplierItem(supplier_id=supplier.id, item_id=item.item_id))
+    if seen_item_ids:
         await db.flush()
 
     await audit_service.log(
@@ -226,9 +229,13 @@ async def update_supplier(
         for item in supplier.items:
             await db.delete(item)
         await db.flush()
+        seen_item_ids: set[int] = set()
         for item in body.items:
-            db.add(SupplierItem(supplier_id=supplier_id, item_id=item.item_id))
-        await db.flush()
+            if item.item_id not in seen_item_ids:
+                seen_item_ids.add(item.item_id)
+                db.add(SupplierItem(supplier_id=supplier_id, item_id=item.item_id))
+        if seen_item_ids:
+            await db.flush()
 
     await audit_service.log(
         db, user_id=updated_by, action=AuditAction.UPDATE,

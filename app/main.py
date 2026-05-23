@@ -4,6 +4,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.v1.router import api_v1_router
@@ -118,6 +119,28 @@ def _register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content=_error_body(code, message),
+        )
+
+    @app.exception_handler(IntegrityError)
+    async def integrity_error_handler(
+        request: Request, exc: IntegrityError
+    ) -> JSONResponse:
+        """
+        Database unique/FK constraint violations → 409 Conflict.
+        Prevents unhandled 500s from race conditions or duplicate data.
+        """
+        logger.warning(
+            "integrity_error",
+            path=request.url.path,
+            method=request.method,
+            detail=str(exc.orig) if exc.orig else str(exc),
+        )
+        return JSONResponse(
+            status_code=409,
+            content=_error_body(
+                "CONFLICT",
+                "The operation conflicts with the current resource state.",
+            ),
         )
 
     @app.exception_handler(Exception)
